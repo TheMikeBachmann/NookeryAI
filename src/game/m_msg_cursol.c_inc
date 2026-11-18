@@ -1179,7 +1179,18 @@ static int mMsg_Main_Cursol_ControlCursol(mMsg_Window_c* msg_p) {
     mMsg_cursor_waiting = FALSE;
 
     while (TRUE) {
-      u8 code = msg_p->msg_data->text_buf.data[idx];
+      u8 code;
+
+#ifdef TARGET_PC
+      /* A live villager line is still being written: take what's new, and wait
+       * here if the cursor has caught up (pc_dialog.h). */
+      if (pc_dialog_stream_pump(msg_p->msg_data->text_buf.data, &msg_p->msg_data->msg_len, idx, mMsg_MSG_BUF_MAX)) {
+        msg_p->end_text_cursor_idx = idx;
+        *cursor_timer = mMsg_Cursol_FrameStep(msg_p);
+        break;
+      }
+#endif
+      code = msg_p->msg_data->text_buf.data[idx];
 
       if (mMsg_Check_CancelOrder(msg_p)) {
         msg_p->cancel_flag = TRUE;

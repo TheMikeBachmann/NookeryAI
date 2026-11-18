@@ -5,8 +5,10 @@
 
 #include <atomic>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace acgc::dialog::llm {
 
@@ -20,11 +22,17 @@ struct Options {
 // Loads the model if it isn't loaded already (or a different file was requested).
 bool load(const Options& options, std::string& error);
 
+// Polled between tokens; returning true abandons the generation.
+using StopFn = std::function<bool()>;
+// Receives each piece of text as it's generated.
+using PieceFn = std::function<void(std::string_view)>;
+
 // One-shot chat completion. `grammar` is GBNF; the output is constrained to it.
-// Returns std::nullopt on failure or when `stop` becomes true.
+// Returns std::nullopt on failure or when `stop` returns true. The start of the
+// previous prompt stays cached, so prompts sharing a prefix start faster.
 std::optional<std::string> generate(const std::string& system, const std::string& user, const std::string& grammar,
-                                    int maxTokens, float temperature, const std::atomic<bool>& stop,
-                                    std::string& error);
+                                    int maxTokens, float temperature, const StopFn& stop, std::string& error,
+                                    const PieceFn& onPiece = {});
 
 void unload();
 

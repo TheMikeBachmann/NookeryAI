@@ -7,6 +7,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace acgc::dialog::msg {
@@ -79,6 +80,33 @@ std::string normalize_punctuation(const std::string& s);
 
 // Joins lines into pages of 4 (button + clear between pages).
 std::vector<uint8_t> paginate(const std::vector<std::vector<uint8_t>>& lines);
+
+// Lays out text that arrives a piece at a time (a model streaming its reply) as
+// game bytes: whole words only, wrapped and paged like wrap_text + paginate.
+class LineStreamer {
+public:
+    LineStreamer(ResolveFn resolve, void* user) : m_resolve(resolve), m_user(user) {}
+    // Bytes for every word completed by `piece`.
+    std::vector<uint8_t> feed(std::string_view piece);
+    // Bytes for the last word plus the end-of-message code.
+    std::vector<uint8_t> finish();
+    bool empty() const { return m_linesOnPage == 0; }
+    // Drops the first word if it's exactly this (a model starting with "Bill:").
+    void drop_leading(std::string word) { m_dropLeading = std::move(word); }
+    // The text committed so far (UTF-8), for logs and history.
+    const std::string& text() const { return m_text; }
+
+private:
+    void commit_word(const std::string& word, std::vector<uint8_t>& out);
+
+    ResolveFn m_resolve;
+    void* m_user;
+    std::string m_pending;
+    std::string m_dropLeading;
+    std::string m_text;
+    int m_lineWidth = 0;
+    int m_linesOnPage = 0; // 0 = nothing written yet
+};
 
 // The model request for rewriting a template's pages in a personality's voice.
 // The reply is {"pages": [...]}, one string per entry in `pages` (template page indices).

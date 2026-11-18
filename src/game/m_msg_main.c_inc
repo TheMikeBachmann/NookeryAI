@@ -334,13 +334,25 @@ static int mMsg_LoadMsgData(mMsg_Data_c* msg_data, int index, int cut) {
 #ifdef TARGET_PC
         /* Generated villager small talk armed by the quest manager (pc_dialog.h). */
         /* Otherwise, anything a town villager says can be a rewrite in their personality's voice. */
-        if (pc_dialog_take(index, msg_data->text_buf.data, mMsg_MSG_BUF_MAX) > 0 ||
-            pc_dialog_rewrite(index, mMsg_window.client_actor_p, msg_data->text_buf.data, mMsg_MSG_BUF_MAX) > 0) {
-            msg_data->msg_no = index;
-            msg_data->data_loaded = TRUE;
-            msg_data->msg_len = mMsg_Count_MsgData(msg_data->text_buf.data);
-            msg_data->cut = cut;
-            return TRUE;
+        {
+            /* A live line may still be arriving (length 0, no end code yet), so the
+             * length comes from the service rather than mMsg_Count_MsgData. */
+            int pc_len = pc_dialog_take(index, msg_data->text_buf.data, mMsg_MSG_BUF_MAX);
+
+            if (pc_len < 0) {
+                pc_len = pc_dialog_rewrite(index, mMsg_window.client_actor_p, msg_data->text_buf.data,
+                                           mMsg_MSG_BUF_MAX);
+                if (pc_len == 0) {
+                    pc_len = -1;
+                }
+            }
+            if (pc_len >= 0) {
+                msg_data->msg_no = index;
+                msg_data->data_loaded = TRUE;
+                msg_data->msg_len = pc_len;
+                msg_data->cut = cut;
+                return TRUE;
+            }
         }
 #endif
 

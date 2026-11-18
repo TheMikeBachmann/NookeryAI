@@ -48,11 +48,23 @@ void pc_dialog_register_villager(const PCDialogVillager* villager);
 int pc_dialog_arm(int msg_no, const PCDialogVillager* villager, const uint8_t* player_name, int player_name_len);
 
 /*
- * Called from the message loader. If a line is armed for `msg_no`, writes the
- * encoded message (ending in the end-of-message code) to `dst` and returns its
- * length; the line is used once. Returns 0 otherwise.
+ * Called from the message loader for every message. If a line is armed for
+ * `msg_no`, writes it to `dst` and returns its length (the line is used once);
+ * otherwise returns -1.
+ *
+ * A live line is still being written by the model when this is called: the
+ * length may be 0 and there is no end code yet. The rest arrives through
+ * pc_dialog_stream_pump.
  */
 int pc_dialog_take(int msg_no, uint8_t* dst, int dst_size);
+
+/*
+ * Called by the message cursor every time it is about to read the character at
+ * `idx`. Appends whatever the model has written since the last call at
+ * `*len` (the end of the game's buffer) and updates `*len`. Returns 1 if the
+ * cursor has caught up with the model and must wait, 0 to carry on.
+ */
+int pc_dialog_stream_pump(uint8_t* buf, int* len, int idx, int buf_size);
 
 /* What the game world looks like right now, for the prompts. */
 typedef struct {

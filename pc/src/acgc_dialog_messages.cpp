@@ -714,6 +714,99 @@ std::optional<std::string> validate_rewrite(const Page& page, const std::string&
     return s;
 }
 
+namespace {
+
+// One word (no spaces) of UTF-8 with {placeholders} as game bytes and pixel width.
+void encode_word(const std::string& word, ResolveFn resolve, void* user, std::vector<uint8_t>& bytes, int& width) {
+    const std::string text = normalize_punctuation(word);
+    for (size_t i = 0; i < text.size();) {
+        if (text[i] == '{') {
+            const size_t close = text.find('}', i);
+            if (close != std::string::npos) {
+                std::vector<uint8_t> code;
+                int w = 0;
+                if (resolve && resolve(text.substr(i + 1, close - i - 1), code, w, user)) {
+                    bytes.insert(bytes.end(), code.begin(), code.end());
+                    width += w;
+                }
+                i = close + 1;
+                continue;
+            }
+        }
+        size_t consumed = 1;
+        const int code = acgc::text::decode(std::string_view(text).substr(i), consumed);
+        i += std::max<size_t>(consumed, 1);
+        if (code < 0 || code > 0xFF || code == kCharControl || code == kCharMessageTag || code == kCharNewLine ||
+            code == kCharSpace) {
+            continue; // no glyph in the game font
+        }
+        bytes.push_back(static_cast<uint8_t>(code));
+        width += mFont_GetCodeWidth(static_cast<uint8_t>(code), 1);
+    }
+}
+
+} // namespace
+
+void LineStreamer::commit_word(const std::string& word, std::vector<uint8_t>& out) {
+    if (m_text.empty() && !m_dropLeading.empty() && word == m_dropLeading) {
+        m_dropLeading.clear();
+        return;
+    }
+    std::vector<uint8_t> bytes;
+    int width = 0;
+    encode_word(word, m_resolve, m_user, bytes, width);
+    if (bytes.empty()) {
+        return;
+    }
+    const int spaceWidth = mFont_GetCodeWidth(kCharSpace, 1);
+    if (m_linesOnPage == 0) {
+        m_linesOnPage = 1;
+    } else if (m_lineWidth + spaceWidth + width > kLineWidth) {
+        if (m_linesOnPage == kLinesPerPage) {
+            out.insert(out.end(), { kCharControl, kButton, kCharControl, kClear });
+            m_linesOnPage = 1;
+        } else {
+            out.push_back(kCharNewLine);
+            ++m_linesOnPage;
+        }
+        m_lineWidth = 0;
+    } else {
+        out.push_back(kCharSpace);
+        m_lineWidth += spaceWidth;
+    }
+    out.insert(out.end(), bytes.begin(), bytes.end());
+    m_lineWidth += width;
+    if (!m_text.empty()) {
+        m_text += ' ';
+    }
+    m_text += word;
+}
+
+std::vector<uint8_t> LineStreamer::feed(std::string_view piece) {
+    std::vector<uint8_t> out;
+    for (char c : piece) {
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+            if (!m_pending.empty()) {
+                commit_word(m_pending, out);
+                m_pending.clear();
+            }
+        } else {
+            m_pending += c;
+        }
+    }
+    return out;
+}
+
+std::vector<uint8_t> LineStreamer::finish() {
+    std::vector<uint8_t> out;
+    if (!m_pending.empty()) {
+        commit_word(m_pending, out);
+        m_pending.clear();
+    }
+    out.insert(out.end(), { kCharControl, kLast });
+    return out;
+}
+
 std::vector<std::vector<uint8_t>> wrap_text(const std::string& utf8, ResolveFn resolve, void* user) {
     struct Word {
         std::vector<uint8_t> bytes;

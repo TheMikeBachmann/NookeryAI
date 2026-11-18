@@ -22,6 +22,7 @@ struct State {
     llama_context* ctx = nullptr;
     llama_batch_ext* batch = nullptr;
     int contextTokens = 0;
+    std::vector<llama_token> cached; // tokens currently in the context's memory, in order
 };
 
 State s_state;
@@ -129,14 +130,14 @@ bool load(const Options& options, std::string& error) {
 }
 
 std::optional<std::string> generate(const std::string& system, const std::string& user, const std::string& grammar,
-                                    int maxTokens, float temperature, const std::atomic<bool>& stop,
-                                    std::string& error) {
+                                    int maxTokens, float temperature, const StopFn& stop, std::string& error,
+                                    const PieceFn& onPiece) {
     if (s_state.ctx == nullptr) {
         error = "model not loaded";
         return std::nullopt;
     }
     const llama_vocab* vocab = llama_model_get_vocab(s_state.model);
-    llama_memory_clear(llama_get_memory(s_state.ctx), true);
+    auto shouldStop = [&] { return stop && stop(); };
 
     const std::string prompt = apply_chat_template(system, user);
     const int needed = -llama_tokenize(vocab, prompt.c_str(), static_cast<int32_t>(prompt.size()), nullptr, 0, true, true);
@@ -164,21 +165,37 @@ std::optional<std::string> generate(const std::string& system, const std::string
     llama_sampler_chain_add(chain, llama_sampler_init_temp(temperature));
     llama_sampler_chain_add(chain, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
+    // Reuse whatever the last prompt had in common with this one (usually the system
+    // prompt); at least one token has to be processed to get fresh logits.
+    llama_memory_t memory = llama_get_memory(s_state.ctx);
+    size_t common = 0;
+    while (common < s_state.cached.size() && common + 1 < tokens.size() && s_state.cached[common] == tokens[common]) {
+        ++common;
+    }
+    if (common == 0 || !llama_memory_seq_rm(memory, 0, static_cast<llama_pos>(common), -1)) {
+        llama_memory_clear(memory, true);
+        common = 0;
+    }
+    s_state.cached.assign(tokens.begin(), tokens.begin() + static_cast<std::ptrdiff_t>(common));
+
     std::string out;
-    const llama_token* next = tokens.data();
-    int32_t count = static_cast<int32_t>(tokens.size());
-    llama_pos pos = 0;
+    const llama_token* next = tokens.data() + common;
+    int32_t count = static_cast<int32_t>(tokens.size() - common);
+    llama_pos pos = static_cast<llama_pos>(common);
     llama_token tok = 0;
     bool finished = false;
     for (int generated = 0; generated < maxTokens; ++generated) {
-        if (stop) {
+        if (shouldStop()) {
             break;
         }
         batch_set_tokens(s_state.batch, next, count, pos);
         if (const int ret = llama_process(s_state.ctx, LLAMA_PROCESS_TYPE_DECODE, s_state.batch); ret != 0) {
             error = "llama_process failed (" + std::to_string(ret) + ")";
+            s_state.cached.clear();
+            llama_memory_clear(memory, true);
             break;
         }
+        s_state.cached.insert(s_state.cached.end(), next, next + count);
         pos += count;
         tok = llama_sampler_sample(chain, s_state.ctx, -1);
         if (llama_vocab_is_eog(vocab, tok)) {
@@ -189,13 +206,16 @@ std::optional<std::string> generate(const std::string& system, const std::string
         const int n = llama_token_to_piece(vocab, tok, piece, sizeof(piece), 0, false);
         if (n > 0) {
             out.append(piece, static_cast<size_t>(n));
+            if (onPiece) {
+                onPiece(std::string_view(piece, static_cast<size_t>(n)));
+            }
         }
         next = &tok;
         count = 1;
     }
     llama_sampler_free(chain);
 
-    if (stop) {
+    if (shouldStop()) {
         return std::nullopt;
     }
     if (!finished && error.empty()) {
