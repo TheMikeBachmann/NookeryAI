@@ -90,6 +90,9 @@ void pc_dialog_begin_talk(const PCDialogVillager* villager, const void* actor, c
  */
 void pc_dialog_note_talk(int msg_no, const char* kind);
 
+/* Starts the service (and loading the model) early, so the first conversation doesn't wait. */
+void pc_dialog_start(void);
+
 /* Called when the message window lets go of its speaker. */
 void pc_dialog_end_talk(void);
 
@@ -103,9 +106,12 @@ void pc_dialog_register_roots(int looks, const char* situation, const int* msg_n
 
 /*
  * Called from the message loader for every message while `speaker_actor` is
- * talking. If a rewrite of `msg_no` in the current villager's voice is ready,
- * writes it to `dst` and returns its length; otherwise returns 0 (and the
- * message is queued to be rewritten).
+ * talking. Returns -1 to play `msg_no` as the game wrote it. Otherwise `msg_no`
+ * is shown in the current villager's voice: either a ready rewrite written to
+ * `dst` (its length is returned), or a live rewrite (returns 0, or however much
+ * is ready) whose pages arrive through pc_dialog_stream_pump as the model writes
+ * them. Choices, branches and other codes are kept; if the model stalls, the rest
+ * of the message plays as written.
  */
 int pc_dialog_rewrite(int msg_no, const void* speaker_actor, uint8_t* dst, int dst_size);
 

@@ -340,11 +340,10 @@ static int mMsg_LoadMsgData(mMsg_Data_c* msg_data, int index, int cut) {
             int pc_len = pc_dialog_take(index, msg_data->text_buf.data, mMsg_MSG_BUF_MAX);
 
             if (pc_len < 0) {
+                /* -1: play it as written; otherwise its start (0 for a live rewrite that's
+                 * still being written; the rest arrives through pc_dialog_stream_pump). */
                 pc_len = pc_dialog_rewrite(index, mMsg_window.client_actor_p, msg_data->text_buf.data,
                                            mMsg_MSG_BUF_MAX);
-                if (pc_len == 0) {
-                    pc_len = -1;
-                }
             }
             if (pc_len >= 0) {
                 msg_data->msg_no = index;

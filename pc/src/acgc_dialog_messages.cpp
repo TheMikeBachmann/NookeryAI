@@ -439,14 +439,10 @@ int default_width(uint8_t code) {
     return 40;
 }
 
-struct BuildCtx {
-    const Page* page;
-    WidthFn width;
-    void* user;
-};
+} // namespace
 
-bool resolve_for_page(const std::string& key, std::vector<uint8_t>& bytes, int& width, void* user) {
-    auto* ctx = static_cast<BuildCtx*>(user);
+bool resolve_page_placeholder(const std::string& key, std::vector<uint8_t>& bytes, int& width, void* user) {
+    auto* ctx = static_cast<PageResolver*>(user);
     uint8_t code = 0;
     bool cut = false;
     if (!parse_key(key, code, cut)) {
@@ -466,10 +462,20 @@ bool resolve_for_page(const std::string& key, std::vector<uint8_t>& bytes, int& 
     return true;
 }
 
-} // namespace
-
 int Template::rewritable_pages() const {
     return static_cast<int>(std::count_if(pages.begin(), pages.end(), [](const Page& p) { return p.rewritable; }));
+}
+
+std::vector<uint8_t> quest_codes(const std::vector<uint8_t>& b) {
+    std::vector<uint8_t> out;
+    for (size_t i = 0; i < b.size();) {
+        const int size = code_size(&b[i], b.size() - i);
+        if (b[i] == kCharControl && size >= 2 && b[i + 1] == kDemoQuest) {
+            out.insert(out.end(), b.begin() + static_cast<std::ptrdiff_t>(i), b.begin() + static_cast<std::ptrdiff_t>(i + size));
+        }
+        i += size;
+    }
+    return out;
 }
 
 std::vector<int> next_messages(const std::vector<uint8_t>& b) {
@@ -587,6 +593,29 @@ std::optional<Template> parse_template(const std::vector<uint8_t>& b) {
     }
     t.pages.back().beforeChoice = choice;
     return t;
+}
+
+bool looks_like_refusal(const std::string& text) {
+    std::string s;
+    for (char c : text) {
+        s += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    const size_t start = s.find_first_not_of(" .,!-'");
+    s = start == std::string::npos ? std::string() : s.substr(start);
+    for (size_t pos; (pos = s.find("\xe2\x80\x99")) != std::string::npos;) {
+        s.replace(pos, 3, "'");
+    }
+    static const char* kStarts[] = { "i cannot", "i can't", "i can not", "i'm not able", "i am not able",
+                                     "i'm unable", "i am unable", "i won't", "i will not", "i'm sorry, but",
+                                     "sorry, but i", "i apologize", "as an ai", "i must decline",
+                                     "i don't feel comfortable", "i'm not comfortable" };
+    for (const char* p : kStarts) {
+        if (s.rfind(p, 0) == 0) {
+            return true;
+        }
+    }
+    return s.find("as an ai") != std::string::npos || s.find("language model") != std::string::npos ||
+           s.find("in the villager's voice") != std::string::npos;
 }
 
 std::string normalize_punctuation(const std::string& s) {
@@ -747,9 +776,27 @@ void encode_word(const std::string& word, ResolveFn resolve, void* user, std::ve
 
 } // namespace
 
-void LineStreamer::commit_word(const std::string& word, std::vector<uint8_t>& out) {
+void LineStreamer::commit_word(const std::string& word, std::vector<uint8_t>& out, bool last) {
     if (m_text.empty() && !m_dropLeading.empty() && word == m_dropLeading) {
         m_dropLeading.clear();
+        return;
+    }
+    // A "word" of only punctuation ("??", "!!!", ",?") is what a model writes when the grammar
+    // blocked the word it wanted. Mid-line it's dropped; at the very end its last mark is attached
+    // to the previous word. "..." and "-" are real.
+    const bool punctOnly = !word.empty() && word.find('{') == std::string::npos &&
+                           std::none_of(word.begin(), word.end(), [](char ch) { return std::isalnum(static_cast<unsigned char>(ch)); });
+    if (punctOnly && word != "..." && word != "-") {
+        const char mark = word.back();
+        if (!last || m_linesOnPage == 0 || std::strchr(".!?", mark) == nullptr) {
+            return;
+        }
+        const int w = mFont_GetCodeWidth(static_cast<uint8_t>(mark), 1);
+        if (m_lineWidth + w <= kLineWidth) {
+            out.push_back(static_cast<uint8_t>(mark));
+            m_lineWidth += w;
+            m_text += mark;
+        }
         return;
     }
     std::vector<uint8_t> bytes;
@@ -801,13 +848,19 @@ std::vector<uint8_t> LineStreamer::feed(std::string_view piece) {
     return out;
 }
 
-std::vector<uint8_t> LineStreamer::finish() {
+std::vector<uint8_t> LineStreamer::finish(bool endMessage) {
     std::vector<uint8_t> out;
+    // A line cut off at the length cap can end inside a placeholder ("{pla"): drop that part.
+    if (const size_t open = m_pending.rfind('{'); open != std::string::npos && m_pending.find('}', open) == std::string::npos) {
+        m_pending.erase(open);
+    }
     if (!m_pending.empty()) {
-        commit_word(m_pending, out);
+        commit_word(m_pending, out, /*last=*/true);
         m_pending.clear();
     }
-    out.insert(out.end(), { kCharControl, kLast });
+    if (endMessage) {
+        out.insert(out.end(), { kCharControl, kLast });
+    }
     return out;
 }
 
@@ -890,15 +943,16 @@ std::vector<uint8_t> paginate(const std::vector<std::vector<uint8_t>>& lines) {
 }
 
 RewriteRequest rewrite_request(const Template& t, const std::string& personalityId, const std::string& voice,
-                               const std::string& situation) {
+                               const std::string& situation, const std::string& setting,
+                               const std::string& toneRules) {
     RewriteRequest r;
     r.system =
-        "You restyle dialog for a villager in a cozy, all-ages village life game where the residents are "
-        "talking animals. You get one message the villager says, split into pages (each page fills its own "
+        "You restyle dialog for a villager in " + setting + ". You get one message the villager says, split into pages (each page fills its own "
         "text box). Edit every page so it sounds like this villager: keep the original sentences and what "
         "they say, and change the wording and tone to fit the personality. You may add one short phrase of "
         "flavor per page; don't add sentences about other topics.\n"
-        "Rules:\n"
+        "Rules:\n" +
+        toneRules +
         "- Keep what matters for what happens next: what is being offered, given, sold, bought, asked for or "
         "shown, and every price and number. If the villager offers a shirt, the edit still offers the shirt.\n"
         "- The villager is the one speaking, to the player (\"you\"). Never swap who gives, sells, buys, "
@@ -950,6 +1004,164 @@ RewriteRequest rewrite_request(const Template& t, const std::string& personality
     return r;
 }
 
+std::vector<uint8_t> original_from(const Template& t, size_t page) {
+    std::vector<uint8_t> out;
+    for (size_t i = page; i < t.pages.size(); ++i) {
+        if (i > page) {
+            out.insert(out.end(), t.separators[i - 1].begin(), t.separators[i - 1].end());
+        }
+        out.insert(out.end(), t.pages[i].original.begin(), t.pages[i].original.end());
+    }
+    out.insert(out.end(), t.tail.begin(), t.tail.end());
+    return out;
+}
+
+std::set<int> string_codes(const Template& t) {
+    return t.pages.empty() ? std::set<int>{} : t.pages.front().messageStrings;
+}
+
+bool asks_choice(const Page& page) { return page.beforeChoice && ends_with_question(page.text); }
+
+std::string live_page_system(const std::string& setting, const std::string& toneRules) {
+    return "You voice a villager in " + setting +
+           ". The villager is talking with the player. You get one page of what the villager says (one text "
+           "box) as the game wrote it, and say that same page again in the villager's own voice.\n"
+           "Rules:\n" +
+           toneRules +
+           "- Keep the original's sentences: one sentence for each of its sentences, in order, each saying what "
+           "that one says. Put the personality into the wording of those sentences (attitude, slang, swearing, "
+           "insults inside them), not into extra sentences; you may start with an interjection of a few words. "
+           "No new facts, names, events or stories. The next pages are handled separately, so never get ahead of "
+           "them.\n"
+           "- Keep everything that matters for what happens next: what is offered, given, sold, bought, asked "
+           "for or shown, every price and number, and who does what. The villager is the one speaking, to the "
+           "player (\"you\").\n"
+           "- Write every {placeholder} of the original page exactly as written and in the same order; the game "
+           "fills them in. {player} is the player's name, {catchphrase} is the villager's catchphrase, {a_item0} "
+           "is an item with its article (\"a pear\"), {item0} the same item without it, so never write \"a "
+           "{a_item0}\". {free1} and similar are names, places or amounts: the original shows what each one "
+           "means. Never make up new placeholders.\n"
+           "- If the page ends with a question, end with the same question: the player answers it by picking "
+           "from fixed choices.\n"
+           "- Plain spoken words only: no emoji, no quotation marks, no actions or narration.\n"
+           "- Never mention being an AI or a game, and never comment on the task: just say the page.\n"
+           "Examples.\n"
+           "Original: Would you sell it to me for {free19} Bells? Please?\n"
+           "A grumpy villager: Hmph. I'll give you {free19} Bells for it. Deal or not?\n"
+           "A bubbly villager: Ooh! Would you sell it to me for {free19} Bells? Pretty please?\n"
+           "Original: I got this letter from {free15}.\n"
+           "A grumpy villager: Got this letter from {free15}. Don't ask me why.";
+}
+
+namespace {
+
+// One sentence of a page: its text, and how it ends ('?' or '!' or '.', or 0 for a fragment).
+struct Sentence {
+    std::string text;
+    char end = 0;
+};
+
+// Splits page text into sentences at runs of . ! ? (not inside {placeholders}).
+std::vector<Sentence> split_sentences(const std::string& text) {
+    std::vector<Sentence> out;
+    std::string cur;
+    int depth = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        const char ch = text[i];
+        depth += ch == '{' ? 1 : ch == '}' ? -1 : 0;
+        cur += ch;
+        if (depth == 0 && std::strchr(".!?", ch) != nullptr) {
+            while (i + 1 < text.size() && std::strchr(".!?'\")", text[i + 1]) != nullptr) {
+                cur += text[++i];
+            }
+            const bool q = cur.find('?', cur.find_last_not_of(".!?'\")") + 1) != std::string::npos;
+            const bool x = cur.find('!', cur.find_last_not_of(".!?'\")") + 1) != std::string::npos;
+            out.push_back({ collapse(cur), q ? '?' : x ? '!' : '.' });
+            cur.clear();
+        }
+    }
+    if (const std::string rest = collapse(cur); !rest.empty()) {
+        out.push_back({ rest, 0 });
+    }
+    return out;
+}
+
+int word_count_of(const std::string& s) {
+    const std::string plain = collapse(without_placeholders(s));
+    return plain.empty() ? 0 : 1 + static_cast<int>(std::count(plain.begin(), plain.end(), ' '));
+}
+
+} // namespace
+
+LivePageRequest live_page_request(const Page& page, const std::string& system, const std::string& context) {
+    LivePageRequest r;
+    r.system = system;
+    const auto sentences = split_sentences(page.text);
+    r.user = context + "\nThe page to say now (say only this, in the villager's voice; it has " +
+             std::to_string(sentences.size()) + (sentences.size() == 1 ? " sentence" : " sentences") +
+             ", so say " + (sentences.size() == 1 ? "one" : "the same number") + "): " + page.text + "\n\nSay it now.";
+
+    // The page's sentences, one for one and in order, each with a word cap of about twice the
+    // original's and the placeholders that carry meaning (items, prices, names) that it had.
+    // {player} and {catchphrase} are flavor and may go anywhere. An optional interjection of up
+    // to 6 words may come first. A page the player answers with a choice ends on "?". Words are
+    // whole (a cap never cuts one), and nothing else can make up a placeholder.
+    std::string g = "root ::= (intro \" \")?";
+    // Printable ASCII only (the font has no glyphs for most else), minus space, quote, asterisk,
+    // backslash and braces.
+    std::string rules = "c ::= [\\x21\\x23-\\x29\\x2B-\\x5B\\x5D-\\x7A\\x7C\\x7E] | \"{player}\" | \"{catchphrase}\"\n"
+                        "w ::= c{1,12}\n"
+                        "intro ::= w (\" \" w){0,5} [,.!?]\n";
+    const bool choice = asks_choice(page);
+    int totalWords = 6;
+    for (size_t k = 0; k < sentences.size(); ++k) {
+        const auto& sen = sentences[k];
+        std::vector<std::string> keys;
+        for_each_placeholder(sen.text, [&](const std::string& key) {
+            if (key != "player" && key != "catchphrase") {
+                keys.push_back(key);
+            }
+        });
+        // Word caps for the stretches between this sentence's forced placeholders.
+        std::vector<int> stretchWords;
+        {
+            size_t from = 0;
+            for (const auto& key : keys) {
+                const size_t at = sen.text.find("{" + key + "}", from);
+                stretchWords.push_back(word_count_of(sen.text.substr(from, at == std::string::npos ? 0 : at - from)));
+                from = at == std::string::npos ? from : at + key.size() + 2;
+            }
+            stretchWords.push_back(word_count_of(sen.text.substr(std::min(from, sen.text.size()))));
+        }
+        const std::string name = "t" + std::to_string(k);
+        g += (k == 0 ? " " : " \" \" ") + name;
+        std::string rule = name + " ::=";
+        for (size_t p = 0; p < stretchWords.size(); ++p) {
+            const int cap = std::max(3, stretchWords[p] * 3 + 8); // a safety net, not a target
+            totalWords += cap;
+            const std::string words = "(\" \" w){0," + std::to_string(cap - 1) + "}";
+            if (p < keys.size()) {
+                rule += " \" \"? (w " + words + ")? \" \"? \"{" + keys[p] + "}\"";
+            } else if (stretchWords[p] > 0) {
+                rule += " \" \"? w " + words; // ends on a word: the end mark follows it directly
+            }
+        }
+        const bool last = k + 1 == sentences.size();
+        if (last && choice) {
+            rule += " \"?\"";
+        } else if (sen.end != 0) {
+            rule += " [.!?]{1,3}";
+        } else {
+            rule += " [.!?]{0,3}";
+        }
+        rules += rule + "\n";
+    }
+    r.grammar = g + "\n" + rules;
+    r.maxChars = totalWords * 7;
+    r.maxTokens = totalWords * 2 + 16;
+    return r;
+}
+
 std::optional<std::vector<uint8_t>> build(const Template& t, const std::vector<std::optional<std::string>>& pages,
                                           WidthFn width, void* user, size_t maxSize) {
     std::vector<uint8_t> out;
@@ -961,8 +1173,8 @@ std::optional<std::vector<uint8_t>> build(const Template& t, const std::vector<s
         }
         std::vector<std::vector<uint8_t>> lines;
         if (page.rewritable && i < pages.size() && pages[i]) {
-            BuildCtx ctx{ &page, width, user };
-            lines = wrap_text(*pages[i], &resolve_for_page, &ctx);
+            PageResolver ctx{ &page, width, user };
+            lines = wrap_text(*pages[i], &resolve_page_placeholder, &ctx);
         }
         if (lines.empty()) {
             out.insert(out.end(), page.original.begin(), page.original.end());

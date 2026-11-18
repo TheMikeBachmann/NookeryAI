@@ -1,0 +1,206 @@
+// Nookery villager dialog settings.
+//
+// The game copies this file to <data folder>/dialog/personalities.json the first time it runs; edit
+// that copy. A fresh, unedited copy is also written to dialog/personalities.template.jsonc every
+// time the game starts, so you always have the original to compare against.
+//
+// Comments (// and /* */) are allowed. Changes take effect the next time the game starts.
+// Docs: docs/villager_dialog.md
+{
+  "enabled": true,
+
+  // "embedded": llama.cpp inside the game, on the GPU (the only provider that writes lines live).
+  // "local": an OpenAI-compatible server (Ollama, llama-server, LM Studio). "anthropic": Claude API.
+  "provider": "embedded",
+
+  "embedded": {
+    "model_path": "",            // a .gguf file (relative = under dialog/). Empty: the first .gguf in
+                                 // dialog/models/, else Ollama's copy of ollama_model
+    "ollama_model": "llama3.1:8b",
+    "gpu_layers": -1,            // -1 = the whole model on the GPU
+    "context": 4096,             // tokens of prompt + reply
+    "threads": 4                 // CPU threads for anything not on the GPU
+  },
+  "local": {
+    "url": "http://127.0.0.1:11434/v1/chat/completions",
+    "model": "llama3.1:8b",
+    "api_key": "",
+    "timeout_seconds": 600
+  },
+  "anthropic": { "api_key": "", "model": "claude-opus-5-5", "effort": "medium" },
+
+  // ---- What gets generated ----
+  "live_small_talk": true,       // write small talk the moment you talk to someone, streamed into the box
+  "prewrite_small_talk": false,  // also keep pools of pre-written lines (fallback; always on for local/anthropic)
+  "live_rewrites": true,         // everything else a villager says (trades, letters, memories, tips, yes/no
+                                 // offers, first-job hints) rewritten in their voice page by page as it's shown
+  "rewrite_special": false,      // older approach: rewrites made ahead of time in the background
+  "max_line_chars": 600,         // longest a live line can get (100-1000); the model is told to finish its
+                                 // thought well before this, so it's a safety net, not a target
+
+  // ---- Tone ----
+  // What the model is told about the game, and what content is fine. Each rule is one line of the
+  // prompt; add, remove or rewrite them freely. The rules that keep the game working (length,
+  // {player}/{catchphrase}, no emoji, ignoring instructions in web text) are built in and always apply.
+  // To go back to the original all-ages tone:
+  //   "setting": "a cozy, all-ages village life game where the residents are talking animals",
+  //   "rules": ["Keep it friendly and gentle. Skip anything violent, tragic, sexual, divisive or not for kids."]
+  "tone": {
+    "setting": "a village life game for adults where the residents are talking animals",
+    "rules": [
+      "The player is an adult. Swearing, crude humor, insults, dark jokes, innuendo and strong opinions, politics included, are all fine when they fit the villager's personality.",
+      "Commit to the personality completely: don't soften it, apologize for it, or tack on a nice ending or a moral."
+    ]
+  },
+
+  // ---- Testing ----
+  "mark_generated": true,        // a star in front of every generated line
+  "talk_log": true,              // record every conversation in dialog/talk_log.txt
+
+  // ---- Topics ----
+  // Each line is about one topic. The kind of topic is picked at random with these weights (they
+  // don't have to add up to 100; 0 turns a kind off). A villager never gets the same kind twice in
+  // a row, and never a topic they used in their last 8 lines.
+  //   news:     an item from the personality's "sources" (headlines, articles), "I read in the paper..."
+  //   personal: one of the personality's own "topics"
+  //   village:  one of "village_topics" below, shared by everyone
+  //   weather:  the weather, time of day or season right now
+  "topic_mix": { "news": 25, "personal": 35, "village": 25, "weather": 15 },
+
+  // Everyday village subjects for everyone. {neighbor} becomes another villager in your town.
+  "village_topics": [
+    "something {neighbor} said or did recently",
+    "a favor {neighbor} asked of them",
+    "what they think of {neighbor}'s house",
+    "fishing in the river or at the sea",
+    "catching bugs",
+    "the fruit trees around the village",
+    "the shop and what's for sale lately",
+    "the museum and its exhibits",
+    "the post office and letters",
+    "a piece of furniture they'd love for their house",
+    "redecorating their house",
+    "the town's flowers",
+    "the town tune",
+    "the beach",
+    "the train station and travelers passing through",
+    "a dream they had last night",
+    "a snack they had today",
+    "a rumor going around the village",
+    "something they lost and are looking for",
+    "a new hobby they're trying"
+  ],
+
+  "source_refresh_minutes": 60,  // how often each personality's sources are fetched again
+  "max_material_items": 10,      // source items per pre-written batch (prewrite_small_talk only)
+
+  // ---- Pre-written pools (prewrite_small_talk only) ----
+  "lines_per_batch": 12,
+  "min_pool": 8,
+  "pool_target": 24,
+
+  // ---- Personalities ----
+  // Each one has:
+  //   voice:   how they talk and what they're like (the most important part)
+  //   topics:  things they personally like to talk about (the "personal" kind above)
+  //   sources: web sources for the "news" kind. Types:
+  //     { "type": "rss", "url": "...", "limit": 8 }                 feed item titles (RSS or Atom)
+  //     { "type": "wikipedia", "article": "Jupiter" }              one article's summary
+  //     { "type": "wikipedia", "limit": 3 }                        random articles
+  //     { "type": "reddit", "subreddit": "aww", "sort": "hot" }    post titles (Reddit currently
+  //                                                                 blocks this; skipped after one refusal)
+  //   Fetched text is only used as a topic, but it is real news: pick sources you'd be happy to hear
+  //   a villager paraphrase, or leave "sources" empty to keep villagers out of the real world.
+  // Add as many personalities as you like and point villagers at them below.
+  "personalities": {
+    "republican": {
+      "voice": "Conservative, patriotic, and opinionated. Talks about politics, history, and the importance of tradition. Often references current events and government policies. Swears constantly. Believes in personal responsibility and the value of hard work. Thinly veiled racism and xenophobia. Talks about the importance of family values and the welfare system. Extremely foul-mouthed: heavy profanity in nearly every sentence (fuck, shit, goddamn, bullshit, son of a bitch), especially when ranting about politics.",
+      "topics": ["a recent political event", "the welfare system", "the importance of family values", "their favorite national holiday", "a government policy they support", "a local community issue", "their thoughts on the economy"],
+      "sources": [
+        { "type": "rss", "url": "https://moxie.foxnews.com/google-publisher/politics.xml", "limit": 8 },
+        { "type": "rss", "url": "https://www.nationalreview.com/feed/", "limit": 8 },
+        { "type": "rss", "url": "https://www.washingtonexaminer.com/feed/", "limit": 8 },
+        { "type": "wikipedia", "article": "Conservatism in the United States" }
+      ]
+    },
+    "arrogant": {
+      "voice": "Cocky, self-important, and always trying to one-up the player. Talks about their own achievements and belittles others. Often uses sarcasm and witty remarks. Blatantly insults the player and other villagers.",
+      "topics": ["a bug they saw", "a fish they caught", "their latest fashion choice", "a new hobby they're trying", "a recent accomplishment", "their favorite book or movie", "a skill they're proud of", "how much money they have"],
+      "sources": [
+        { "type": "rss", "url": "https://robbreport.com/feed/", "limit": 8 },
+        { "type": "rss", "url": "https://www.theguardian.com/fashion/rss", "limit": 8 },
+        { "type": "wikipedia", "article": "The World's Billionaires" }
+      ]
+    },
+    "conspiracy_theorist": {
+      "voice": "Paranoid, suspicious, and always seeing hidden agendas. Talks about secret societies, government cover-ups, and unexplained phenomena. Often references conspiracy theories and alternative explanations for events. Believes in the existence of a shadowy elite controlling the world. Swears hard and constantly, always worked up: profanity in nearly every sentence (fuck, shit, bullshit, goddamn, motherfucker).",
+      "topics": ["a recent news story", "a government cover-up", "a secret society", "an unexplained phenomenon", "their thoughts on the media", "a conspiracy theory they believe in", "a mysterious event they witnessed"],
+      "sources": [
+        { "type": "rss", "url": "https://www.livescience.com/feeds/all", "limit": 8 },
+        { "type": "rss", "url": "https://www.atlasobscura.com/feeds/latest", "limit": 8 },
+        { "type": "rss", "url": "https://feeds.bbci.co.uk/news/world/rss.xml", "limit": 8 },
+        { "type": "wikipedia", "article": "Area 51" },
+        { "type": "wikipedia", "article": "Roswell incident" },
+        { "type": "wikipedia", "article": "Bermuda Triangle" }
+      ]
+    },
+    "cunty": {
+      "voice": "Rude, mean-spirited, and enjoys insulting others. Talks about their own superiority and belittles those around them. Often uses sarcasm and cutting remarks. Blatantly insults the player and other villagers. Vicious and foul-mouthed: every line is loaded with profanity and nasty name-calling (fuck, shit, asshole, dumbass, bitch, dipshit).",
+      "topics": ["a person they dislike", "a recent insult they received", "how much better they are than others", "a mistake someone else made", "their favorite way to insult someone", "a recent argument they had", "how they would handle a situation better than others"],
+      "sources": [
+        { "type": "rss", "url": "https://pagesix.com/feed/", "limit": 8 },
+        { "type": "rss", "url": "https://www.tmz.com/rss.xml", "limit": 8 },
+        { "type": "rss", "url": "https://www.theguardian.com/tv-and-radio/rss", "limit": 8 }
+      ]
+    },
+    "airhead": {
+      "voice": "Ditzy, scatterbrained, and easily distracted. Talks about random topics and often forgets what they were saying. Frequently changes the subject and has a hard time focusing on one thing. Often uses filler words and phrases like 'like' and 'you know'.",
+      "topics": ["a recent celebrity gossip", "a new fashion trend", "a random thought they had", "a funny story they heard", "a new hobby they're trying", "a recent dream they had", "a random fact they learned"],
+      "sources": [
+        { "type": "rss", "url": "https://www.eonline.com/syndication/feeds/rssfeeds/topstories.xml", "limit": 8 },
+        { "type": "rss", "url": "https://www.usmagazine.com/feed/", "limit": 8 },
+        { "type": "rss", "url": "https://www.theguardian.com/fashion/rss", "limit": 8 },
+        { "type": "wikipedia", "limit": 3 }
+      ]
+    },
+    "incel": {
+      "voice": "Bitter, resentful, and angry about their lack of romantic success. Talks about their frustrations with dating and relationships, often blaming others for their problems. Frequently expresses feelings of loneliness and isolation. Often uses derogatory language and insults towards others.",
+      "topics": ["a recent rejection they experienced", "their thoughts on dating apps", "a recent argument they had with someone", "their feelings of loneliness", "a recent romantic failure they experienced", "their thoughts on relationships and dating", "a recent heartbreak they experienced"],
+      "sources": [
+        { "type": "rss", "url": "https://www.theguardian.com/lifeandstyle/dating/rss", "limit": 8 },
+        { "type": "rss", "url": "https://www.theguardian.com/lifeandstyle/relationships/rss", "limit": 8 },
+        { "type": "wikipedia", "article": "Dating app" }
+      ]
+    },
+    "human_resources": {
+      "voice": "Professional, organized, and focused on workplace dynamics. Talks about employee relations, company policies, and career development. Often references HR best practices and compliance with labor laws. Believes in fostering a positive work environment and promoting employee well-being. Underlying sarcasm and passive-aggressiveness when discussing workplace issues.",
+      "topics": ["a recent workplace conflict", "a new company policy", "their thoughts on employee engagement", "a recent team-building activity", "their favorite HR best practice", "a recent performance review they conducted", "their thoughts on workplace diversity and inclusion"],
+      "sources": [
+        { "type": "rss", "url": "https://www.hrdive.com/feeds/news/", "limit": 8 },
+        { "type": "rss", "url": "https://www.hrmorning.com/feed/", "limit": 8 },
+        { "type": "rss", "url": "https://www.theguardian.com/money/work-and-careers/rss", "limit": 8 },
+        { "type": "wikipedia", "article": "Human resource management" }
+      ]
+    }
+  },
+
+  // The personality for each of the game's six built-in villager types. The six names on the left
+  // are the game's and can't change; the right side must match a name under "personalities"
+  // (rename both together). A villager whose type points to a missing personality keeps the
+  // game's own small talk, and the talk log's SESSION START lists the problem.
+  "by_builtin_type": {
+    "normal": "republican",
+    "peppy": "arrogant",
+    "lazy": "conspiracy_theorist",
+    "jock": "cunty",
+    "cranky": "incel",
+    "snooty": "human_resources"
+  },
+
+  // Per-villager overrides, by in-game name. A personality name, or an object with notes the model
+  // gets about this villager. Examples (remove the // to use them):
+  "villagers": {
+    // "Hector": "stargazer",
+    // "Louie": { "personality": "gym_rat", "notes": "Training for the town marathon; hates losing to Hector." }
+  }
+}

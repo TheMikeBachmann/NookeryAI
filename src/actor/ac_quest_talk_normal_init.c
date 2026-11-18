@@ -2225,6 +2225,8 @@ static void aQMgr_pc_dialog_register_roots(void) {
     };
     int msgs[32];
     int looks, r, k;
+    static const char* fj_hint = "A tip for a brand-new resident who is still doing odd jobs for Tom Nook to pay "
+                                 "off their house: what to do in the village or how something works.";
 
     for (looks = 0; looks < 6; looks++) {
         for (r = 0; r < (int)ARRAY_COUNT(roots); r++) {
@@ -2233,6 +2235,11 @@ static void aQMgr_pc_dialog_register_roots(void) {
             }
             pc_dialog_register_roots(looks, roots[r].situation, msgs, k);
         }
+        /* First-job hints (aQMgr_get_fj_hint_msg): 10 per personality from 0x0841. */
+        for (k = 0; k < 10; k++) {
+            msgs[k] = 0x0841 + looks * 10 + k;
+        }
+        pc_dialog_register_roots(looks, fj_hint, msgs, 10);
     }
 }
 

@@ -213,6 +213,7 @@ extern void mMsg_aram_init2() {
             _JW_GetResourceAram(Msg_table_rom_start, table_aligned, ALIGN_NEXT(table_size, 32));
             _JW_GetResourceAram(Msg_rom_start, data_aligned, ALIGN_NEXT(data_size, 32));
             pc_dialog_set_message_archive(table_aligned, table_size, data_aligned, data_size);
+            pc_dialog_start(); /* load the model now, not at the first conversation */
         }
         free(table);
         free(data);

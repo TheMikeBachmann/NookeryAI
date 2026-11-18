@@ -35,7 +35,9 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <random>
 #include <set>
@@ -109,8 +111,13 @@ struct Source {
 
 struct Personality {
     std::string voice;
-    std::vector<Source> sources;
+    std::vector<std::string> topics; // things they like to talk about ("personal" topics)
+    std::vector<Source> sources;     // "news" topics
 };
+
+// What a line is about; see "topic_mix" in personalities.jsonc.
+enum class TopicKind { News, Personal, Village, Weather, Count };
+constexpr std::array<const char*, 4> kTopicKindNames = { "news", "personal", "village", "weather" };
 
 struct VillagerOverride {
     std::string personality;
@@ -147,17 +154,28 @@ struct Config {
     int linesPerBatch = 12;
     int minPool = 8;     // refill a villager urgently below this
     int poolTarget = 24; // keep topping up to this when nothing else needs doing
-    bool rewriteSpecial = false;   // off for now: phase 1 is chit-chat only
+    bool rewriteSpecial = false;   // pre-made rewrites in the background (superseded by live_rewrites)
+    bool liveRewrites = true;      // everything else a villager says, rewritten page by page as it's shown
     bool liveSmallTalk = true;     // write small talk as the player talks, streamed into the text box
     bool prewriteSmallTalk = false; // also keep pools of pre-written lines (fallback / non-embedded providers)
     bool talkLog = true;           // record every chit-chat line in dialog/talk_log.txt
     bool markGenerated = true;     // put a star in front of generated lines, for testing
+    int maxLineChars = 600;        // hard cap on a live line; the model is asked to finish its thought before it
+    // "tone": what the model is told about the game and what content is fine. Without a "tone"
+    // section the game's original all-ages rules apply.
+    std::string toneSetting = "a cozy, all-ages village life game where the residents are talking animals";
+    std::vector<std::string> toneRules = {
+        "Keep it friendly and gentle. Skip anything violent, tragic, sexual, divisive or not for kids."
+    };
     int sourceRefreshMinutes = 60;
+    std::array<int, 4> topicMix = { 25, 35, 25, 15 }; // weights by TopicKind
+    std::vector<std::string> villageTopics;           // {neighbor} = another villager
     std::map<std::string, Personality> personalities;
     std::array<std::string, 6> byLooks;
     std::map<std::string, VillagerOverride> villagers;
 };
 
+// Fallback when res/dialog/personalities.jsonc (the real defaults, with comments) is missing.
 json default_config_json() {
     auto rss = [](const char* url) { return json{ { "type", "rss" }, { "url", url }, { "limit", 8 } }; };
     [[maybe_unused]] auto reddit = [](const char* sub) { return json{ { "type", "reddit" }, { "subreddit", sub }, { "sort", "hot" }, { "limit", 10 } }; };
@@ -222,6 +240,7 @@ json default_config_json() {
         { "min_pool", 8 },
         { "pool_target", 24 },
         { "rewrite_special", false },
+        { "live_rewrites", true },
         { "live_small_talk", true },
         { "prewrite_small_talk", false },
         { "talk_log", true },
@@ -305,11 +324,37 @@ Config parse_config(const json& j) {
     c.minPool = std::clamp(j.value("min_pool", c.minPool), 1, 100);
     c.poolTarget = std::clamp(j.value("pool_target", c.poolTarget), c.minPool, 200);
     c.rewriteSpecial = j.value("rewrite_special", c.rewriteSpecial);
+    c.liveRewrites = j.value("live_rewrites", c.liveRewrites);
     c.liveSmallTalk = j.value("live_small_talk", c.liveSmallTalk);
     c.prewriteSmallTalk = j.value("prewrite_small_talk", c.prewriteSmallTalk);
     c.talkLog = j.value("talk_log", c.talkLog);
     c.markGenerated = j.value("mark_generated", c.markGenerated);
+    // The message buffer is 1536 bytes; 1000 characters plus page codes still fits.
+    c.maxLineChars = std::clamp(j.value("max_line_chars", c.maxLineChars), 100, 1000);
+    if (auto it = j.find("tone"); it != j.end() && it->is_object()) {
+        c.toneSetting = it->value("setting", c.toneSetting);
+        if (auto r = it->find("rules"); r != it->end() && r->is_array()) {
+            c.toneRules.clear();
+            for (const auto& rj : *r) {
+                if (rj.is_string() && !rj.get<std::string>().empty()) {
+                    c.toneRules.push_back(rj.get<std::string>());
+                }
+            }
+        }
+    }
     c.sourceRefreshMinutes = std::max(5, j.value("source_refresh_minutes", c.sourceRefreshMinutes));
+    if (auto it = j.find("topic_mix"); it != j.end() && it->is_object()) {
+        for (size_t k = 0; k < kTopicKindNames.size(); ++k) {
+            c.topicMix[k] = std::clamp(it->value(kTopicKindNames[k], c.topicMix[k]), 0, 1000);
+        }
+    }
+    if (auto it = j.find("village_topics"); it != j.end() && it->is_array()) {
+        for (const auto& tj : *it) {
+            if (tj.is_string() && !tj.get<std::string>().empty()) {
+                c.villageTopics.push_back(tj.get<std::string>());
+            }
+        }
+    }
 
     if (auto it = j.find("personalities"); it != j.end() && it->is_object()) {
         for (const auto& [id, pj] : it->items()) {
@@ -318,6 +363,13 @@ Config parse_config(const json& j) {
             }
             Personality p;
             p.voice = pj.value("voice", "");
+            if (auto t = pj.find("topics"); t != pj.end() && t->is_array()) {
+                for (const auto& tj : *t) {
+                    if (tj.is_string() && !tj.get<std::string>().empty()) {
+                        p.topics.push_back(tj.get<std::string>());
+                    }
+                }
+            }
             if (auto src = pj.find("sources"); src != pj.end() && src->is_array()) {
                 for (const auto& sj : *src) {
                     if (auto s = parse_source(sj)) {
@@ -809,7 +861,8 @@ struct VillagerInfo {
 
 struct Material {
     std::vector<std::string> items;
-    Clock::time_point fetched{};
+    Clock::time_point fetched{};    // last successful fetch
+    Clock::time_point retryAfter{}; // after a failed fetch
 };
 
 // The in-game world when the current conversation started.
@@ -830,7 +883,25 @@ struct Talk {
     std::string villager;
     std::string personality;
     Names names;
+    std::string situation;            // what's going on, from the conversation's opener
+    std::vector<std::string> history; // what the villager has said so far (as shown), for context
 };
+
+// A message being rewritten live: its template and the print widths of its inline strings,
+// measured on the main thread when it loaded (the worker can't ask the game).
+struct RewritePlan {
+    int msgNo = -1;
+    msg::Template tpl;
+    std::map<std::pair<int, bool>, int> widths; // (code, cut) -> pixels
+    size_t bufSize = 0;
+    std::string situation;
+};
+
+int plan_width(uint8_t code, bool cut, void* user) {
+    const auto* plan = static_cast<const RewritePlan*>(user);
+    auto it = plan->widths.find({ code, cut });
+    return it == plan->widths.end() ? -1 : it->second;
+}
 
 // One message rewritten in a personality's voice. `pages` lines up with the
 // message template's pages; nullopt keeps that page's original text. A rewrite
@@ -928,17 +999,30 @@ public:
             load_config();
             load_cache();
             load_rewrites();
+            const auto problems = config_problems();
+            for (const auto& p : problems) {
+                Log.warn("personalities.json: {}", p);
+            }
             if (m_config.enabled && m_config.talkLog) {
                 m_talkLog.open(dir() / "talk_log.txt");
+                std::string problemText = "none";
+                if (!problems.empty()) {
+                    problemText.clear();
+                    for (const auto& p : problems) {
+                        problemText += "- " + p + "\n";
+                    }
+                }
                 m_talkLog.write("SESSION START", {
                     { "Provider", provider_name() },
                     { "Live small talk", m_config.liveSmallTalk ? "on" : "off" },
                     { "Pre-written small talk", pools_on() ? "on" : "off" },
                     { "Rewrites of other messages", m_config.rewriteSpecial ? "on" : "off" },
+                    { "Personality problems", problemText },
                 });
             }
             if (m_config.enabled) {
                 m_worker = std::thread([this] { run(); });
+                m_fetcher = std::thread([this] { fetch_loop(); });
             }
         });
     }
@@ -959,6 +1043,7 @@ public:
         if (added) {
             m_backlogDirty = true;
             m_cv.notify_all();
+            wake_fetcher(); // their personality's sources may not be fetched yet
         }
     }
 
@@ -971,12 +1056,25 @@ public:
         std::string line;
         {
             std::lock_guard lock(m_mutex);
+            // No personality to write with: the game's own line plays.
+            if (const auto pid = resolve_personality(m_villagers[name]).first; !m_config.personalities.count(pid)) {
+                m_armed.reset();
+                if (m_talkLog.enabled()) {
+                    m_talkLog.write("ORIGINAL LINE  " + name, {
+                        { "Message", std::to_string(msgNo) },
+                        { "Why", pid.empty() ? "no personality set for their type in by_builtin_type"
+                                             : "personality \"" + pid + "\" isn't in personalities" },
+                        { "Text", original_text(msgNo) },
+                    });
+                }
+                return false;
+            }
             // Live: the worker writes the line now and it streams into the text box.
             if (m_liveReady && m_talk.active && m_talk.villager == name) {
                 m_stream = Stream{};
                 m_stream.id = ++m_streamCounter;
                 m_stream.lastProgress = Clock::now();
-                m_live = LiveRequest{ m_stream.id, name, m_talk.names, msgNo };
+                m_live = LiveRequest{ m_stream.id, name, m_talk.names, msgNo, {} };
                 m_preempt = true; // background work yields to this
                 m_armed = Armed{ msgNo, {}, m_stream.id };
                 m_cv.notify_all();
@@ -1033,7 +1131,7 @@ public:
         talk.names.catchphrase.assign(v.catchphrase, v.catchphrase + std::clamp(v.catchphrase_len, 0, PC_DIALOG_CATCHPHRASE_LEN));
         std::lock_guard lock(m_mutex);
         talk.personality = resolve_personality(m_villagers[name]).first;
-        m_talk = std::move(talk);
+        m_talk = std::move(talk); // a new conversation: no history, no situation yet
         m_hot = name;
         if (scene != nullptr) {
             m_scene = Scene{ true, scene->weather, scene->month, scene->day, scene->weekday, scene->hour, scene->minute };
@@ -1047,10 +1145,11 @@ public:
             std::lock_guard lock(m_mutex);
             villager = m_talk.villager;
         }
-        m_talkLog.write("OTHER LINE  " + villager, {
+        const bool rewritten = m_config.liveRewrites && m_config.provider == Provider::Embedded;
+        m_talkLog.write((rewritten ? "CONVERSATION  " : "OTHER LINE  ") + villager, {
             { "Message", std::to_string(msgNo) },
             { "Kind", kind != nullptr ? kind : "unknown" },
-            { "Text", original_text(msgNo) },
+            { rewritten ? "Original" : "Text", original_text(msgNo) },
         });
     }
 
@@ -1078,9 +1177,17 @@ public:
     }
 
     // Main thread, from the message loader.
+    // Main thread, from the message loader. Returns the bytes to show now (possibly 0 for a
+    // live rewrite whose words are still coming), or -1 to play the message as the game wrote it.
     int rewrite(int msgNo, const void* actor, uint8_t* dst, int dstSize) {
-        if (!m_config.enabled || !m_config.rewriteSpecial || actor == nullptr || !msg::available()) {
-            return 0;
+        if (!m_config.enabled || actor == nullptr || !msg::available()) {
+            return -1;
+        }
+        if (m_config.liveRewrites && m_config.provider == Provider::Embedded) {
+            return rewrite_live(msgNo, actor, dstSize);
+        }
+        if (!m_config.rewriteSpecial) {
+            return -1;
         }
         Rewrite rw;
         Names names;
@@ -1088,7 +1195,7 @@ public:
         {
             std::lock_guard lock(m_mutex);
             if (!m_talk.active || m_talk.actor != actor || m_talk.personality.empty()) {
-                return 0;
+                return -1;
             }
             personality = m_talk.personality;
             names = m_talk.names;
@@ -1100,27 +1207,78 @@ public:
                     m_seen.push_back({ personality, msgNo });
                     m_cv.notify_all();
                 }
-                return 0;
+                return -1;
             }
             rw = it->second;
         }
         if (rw.pages.empty()) {
-            return 0;
+            return -1;
         }
         const auto original = msg::original(msgNo);
         if (!original || msg::fingerprint(*original) != rw.fingerprint) {
-            return 0;
+            return -1;
         }
         const auto tpl = msg::parse_template(*original);
         if (!tpl) {
-            return 0;
+            return -1;
         }
         const auto bytes = msg::build(*tpl, rw.pages, &game_string_width, &names, static_cast<size_t>(dstSize));
         if (!bytes) {
-            return 0;
+            return -1;
         }
         std::memcpy(dst, bytes->data(), bytes->size());
         return static_cast<int>(bytes->size());
+    }
+
+    // Sets up a live rewrite of `msgNo` for the villager being talked to. Main thread.
+    int rewrite_live(int msgNo, const void* actor, int dstSize) {
+        if (!m_liveReady) {
+            return -1; // model still loading
+        }
+        const auto original = msg::original(msgNo);
+        auto tpl = original ? msg::parse_template(*original) : std::nullopt;
+        std::lock_guard lock(m_mutex);
+        if (!m_talk.active || m_talk.actor != actor || !m_config.personalities.count(m_talk.personality)) {
+            return -1;
+        }
+        if (auto it = m_situations.find(msgNo); it != m_situations.end()) {
+            m_talk.situation = it->second; // an opener; its branches keep this situation
+        }
+        if (!tpl || tpl->rewritable_pages() == 0) {
+            if (m_talkLog.enabled() && original) {
+                m_talkLog.write("ORIGINAL LINE  " + m_talk.villager, {
+                    { "Message", std::to_string(msgNo) },
+                    { "Why", "nothing in it can be reworded safely (only codes, or codes the rewriter can't keep)" },
+                    { "Text", msg::describe(*original) },
+                });
+            }
+            return -1;
+        }
+
+        auto plan = std::make_shared<RewritePlan>();
+        plan->msgNo = msgNo;
+        plan->bufSize = static_cast<size_t>(dstSize);
+        plan->situation = m_talk.situation;
+        for (int code : msg::string_codes(*tpl)) {
+            for (bool cut : { false, true }) {
+                plan->widths[{ code, cut }] = game_string_width(static_cast<uint8_t>(code), cut, &m_talk.names);
+            }
+        }
+        plan->tpl = std::move(*tpl);
+
+        m_stream = Stream{};
+        m_stream.id = ++m_streamCounter;
+        m_stream.lastProgress = Clock::now();
+        m_stream.active = true; // shown from now on; pump() adds what the worker writes
+        m_stream.shownAt = Clock::now();
+        m_stream.rescue = msg::original_from(plan->tpl, 0);
+        LiveRequest req{ m_stream.id, m_talk.villager, m_talk.names, msgNo, {} };
+        req.plan = std::move(plan);
+        m_live = std::move(req);
+        m_preempt = true;
+        m_armed.reset();
+        m_cv.notify_all();
+        return 0;
     }
 
     int take(int msgNo, uint8_t* dst, int dstSize) {
@@ -1162,7 +1320,11 @@ public:
             return 0;
         }
         auto endNow = [&] {
-            if (*len + 2 <= bufSize) {
+            if (!m_stream.rescue.empty() && *len + static_cast<int>(m_stream.rescue.size()) <= bufSize) {
+                // Finish the message as the game wrote it, so its choices and branches still work.
+                std::memcpy(buf + *len, m_stream.rescue.data(), m_stream.rescue.size());
+                *len += static_cast<int>(m_stream.rescue.size());
+            } else if (*len + 2 <= bufSize) {
                 buf[*len] = kCharControl;
                 buf[*len + 1] = kContLast;
                 *len += 2;
@@ -1213,6 +1375,9 @@ private:
         bool cancelled = false; // the game moved on; stop writing
         std::vector<uint8_t> bytes; // game bytes written so far
         size_t delivered = 0;       // how many the game has
+        // A live rewrite: what finishes the message as the game wrote it if the model stalls
+        // (empty for small talk, which just ends).
+        std::vector<uint8_t> rescue;
         Clock::time_point lastProgress{};
         Clock::time_point shownAt{};
     };
@@ -1221,8 +1386,40 @@ private:
         uint64_t id = 0;
         std::string villager;
         Names names;
-        int msgNo = -1; // the game's chit-chat message this line replaces
+        int msgNo = -1; // the game's message this replaces
+        std::shared_ptr<RewritePlan> plan; // set: a live rewrite of msgNo; unset: small talk
     };
+
+    // The "tone" rules as prompt lines ("- rule\n" each).
+    std::string tone_rules_text() const {
+        std::string out;
+        for (const auto& r : m_config.toneRules) {
+            out += "- " + r + "\n";
+        }
+        return out;
+    }
+
+    // Names in by_builtin_type and villagers that don't match a personality. Checked once at load.
+    std::vector<std::string> config_problems() const {
+        std::vector<std::string> out;
+        for (size_t i = 0; i < kLooksNames.size(); ++i) {
+            const auto& pid = m_config.byLooks[i];
+            if (pid.empty()) {
+                out.push_back(std::string("by_builtin_type has no personality for \"") + kLooksNames[i] +
+                              "\"; those villagers keep the game's own small talk");
+            } else if (!m_config.personalities.count(pid)) {
+                out.push_back(std::string("by_builtin_type \"") + kLooksNames[i] + "\" points to \"" + pid +
+                              "\", which isn't in personalities; those villagers keep the game's own small talk");
+            }
+        }
+        for (const auto& [name, v] : m_config.villagers) {
+            if (!v.personality.empty() && !m_config.personalities.count(v.personality)) {
+                out.push_back("villagers \"" + name + "\" points to \"" + v.personality +
+                              "\", which isn't in personalities; using their type's personality instead");
+            }
+        }
+        return out;
+    }
 
     // Pre-written pools are used when asked for, and always for providers that can't write live.
     bool pools_on() const { return m_config.prewriteSmallTalk || m_config.provider != Provider::Embedded; }
@@ -1268,10 +1465,30 @@ private:
 
     const std::filesystem::path& dir() const { return m_dir; }
 
+    // res/dialog/personalities.jsonc, the commented template shipped with the game.
+    static std::optional<std::string> read_template() {
+        std::ifstream in(acgc::data::base_path_relative("res/dialog/personalities.jsonc"), std::ios::binary);
+        if (!in) {
+            return std::nullopt;
+        }
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
+    }
+
     void load_config() {
         const auto path = dir() / "personalities.json";
         std::error_code ec;
         std::filesystem::create_directories(dir(), ec);
+        const auto tpl = read_template();
+        if (tpl) {
+            // A pristine copy to compare against, refreshed every start.
+            if (std::ofstream out(dir() / "personalities.template.jsonc", std::ios::binary | std::ios::trunc); out) {
+                out << *tpl;
+            }
+        } else {
+            Log.warn("res/dialog/personalities.jsonc is missing; using built-in defaults");
+        }
         json j;
         if (std::ifstream in(path); in) {
             j = json::parse(in, nullptr, false, /*ignore_comments=*/true);
@@ -1281,9 +1498,18 @@ private:
                 return;
             }
         } else {
-            j = default_config_json();
-            if (std::ofstream out(path); out) {
-                out << j.dump(2) << '\n';
+            if (tpl) {
+                j = json::parse(*tpl, nullptr, false, /*ignore_comments=*/true);
+            }
+            if (!tpl || j.is_discarded()) {
+                j = default_config_json();
+            }
+            if (std::ofstream out(path, std::ios::binary); out) {
+                if (tpl && !j.is_discarded()) {
+                    out << *tpl; // keep the comments
+                } else {
+                    out << j.dump(2) << '\n';
+                }
                 Log.info("Wrote default villager dialog config to {}", path.string());
             }
         }
@@ -1420,17 +1646,23 @@ private:
             m_stopping = true;
         }
         m_cv.notify_all();
+        wake_fetcher();
         // Runs during static destruction, so no file I/O here; the worker saves
         // the cache after every batch and every idle wake-up (<= 30 s).
         if (m_worker.joinable()) {
             m_worker.join();
         }
+        if (m_fetcher.joinable()) {
+            m_fetcher.join();
+        }
     }
 
-    std::optional<http::Response> fetch(http::Request req) {
+    // `preemptible`: give up when a live line is waiting (model requests on the worker thread).
+    // Source fetches run on their own thread and never need to.
+    std::optional<http::Response> fetch(http::Request req, bool preemptible = true) {
         auto task = http::start(std::move(req));
         while (!task.ready()) {
-            if (m_stopping || m_preempt) { // shutting down, or a live line is waiting
+            if (m_stopping || (preemptible && m_preempt)) { // shutting down, or a live line is waiting
                 task.cancel();
                 return std::nullopt;
             }
@@ -1458,7 +1690,7 @@ private:
         req.url = url;
         req.headers = { { "User-Agent", kUserAgent }, { "Accept", "*/*" } };
         req.totalTimeout = std::chrono::seconds(30);
-        auto res = fetch(std::move(req));
+        auto res = fetch(std::move(req), /*preemptible=*/false);
         if (status != nullptr) {
             *status = res ? res->statusCode : 0;
         }
@@ -1540,21 +1772,76 @@ private:
         return items;
     }
 
-    std::vector<std::string> material_for(const std::string& personalityId, const Personality& p) {
-        auto& m = m_material[personalityId];
-        const auto maxAge = std::chrono::minutes(m_config.sourceRefreshMinutes);
-        if (m.items.empty() || Clock::now() - m.fetched > maxAge) {
-            std::vector<std::string> items;
-            for (const auto& s : p.sources) {
-                auto got = fetch_source(s);
-                items.insert(items.end(), got.begin(), got.end());
-            }
-            if (!items.empty() || m.items.empty()) {
-                m.items = std::move(items);
-            }
-            m.fetched = Clock::now();
+    // ---- Source fetching (its own thread, so lines never wait on the network) ----
+
+    void wake_fetcher() {
+        {
+            std::lock_guard lock(m_fetchMutex);
+            m_fetchWake = true;
         }
-        std::vector<std::string> picked = m.items;
+        m_fetchCv.notify_all();
+    }
+
+    // Whatever has been fetched for a personality so far (may be empty). Any thread.
+    std::vector<std::string> cached_material(const std::string& personalityId) {
+        std::lock_guard lock(m_materialMutex);
+        auto it = m_material.find(personalityId);
+        return it == m_material.end() ? std::vector<std::string>{} : it->second.items;
+    }
+
+    // Keeps the sources of every personality in town fresh. Fetcher thread.
+    void fetch_loop() {
+        while (!m_stopping) {
+            std::vector<std::string> inUse;
+            {
+                std::lock_guard lock(m_mutex);
+                for (const auto& [name, info] : m_villagers) {
+                    const std::string pid = resolve_personality(info).first;
+                    if (std::find(inUse.begin(), inUse.end(), pid) == inUse.end()) {
+                        inUse.push_back(pid);
+                    }
+                }
+            }
+            const auto maxAge = std::chrono::minutes(m_config.sourceRefreshMinutes);
+            for (const auto& pid : inUse) {
+                auto pit = m_config.personalities.find(pid);
+                if (m_stopping || pit == m_config.personalities.end() || pit->second.sources.empty()) {
+                    continue;
+                }
+                {
+                    std::lock_guard lock(m_materialMutex);
+                    const auto& m = m_material[pid];
+                    const auto now = Clock::now();
+                    const bool fresh = !m.items.empty() && now - m.fetched < maxAge;
+                    if (fresh || now < m.retryAfter) {
+                        continue;
+                    }
+                }
+                std::vector<std::string> items;
+                for (const auto& src : pit->second.sources) {
+                    auto got = fetch_source(src);
+                    items.insert(items.end(), got.begin(), got.end());
+                }
+                std::lock_guard lock(m_materialMutex);
+                auto& m = m_material[pid];
+                if (!items.empty()) {
+                    m.items = std::move(items);
+                    m.fetched = Clock::now();
+                    Log.info("Fetched {} topics for {}", m.items.size(), pid);
+                } else if (!m_stopping) {
+                    m.retryAfter = Clock::now() + std::chrono::minutes(5); // keep any older items meanwhile
+                    Log.warn("No topics fetched for {}; retrying in 5 minutes", pid);
+                }
+            }
+            std::unique_lock lock(m_fetchMutex);
+            m_fetchCv.wait_for(lock, std::chrono::minutes(1), [&] { return m_stopping || m_fetchWake; });
+            m_fetchWake = false;
+        }
+    }
+
+    // Up to max_material_items fetched items for a pre-written batch. Worker thread.
+    std::vector<std::string> material_for(const std::string& personalityId, [[maybe_unused]] const Personality& p) {
+        std::vector<std::string> picked = cached_material(personalityId);
         std::shuffle(picked.begin(), picked.end(), m_workerRng);
         // Small local models have short context windows (Ollama defaults to a few thousand tokens).
         if (picked.size() > static_cast<size_t>(m_config.maxMaterialItems)) {
@@ -1610,9 +1897,8 @@ private:
 
     std::optional<std::vector<std::string>> generate(const VillagerInfo& v, const std::string& personalityId,
                                                      const Personality& p, const std::string& notes) {
-        static const std::string kSystem =
-            "You write ambient small talk for villagers in a cozy, all-ages village life game where the "
-            "residents are talking animals. Each line is one self-contained thing a villager says when the "
+        const std::string kSystem =
+            "You write ambient small talk for villagers in " + m_config.toneSetting + ". Each line is one self-contained thing a villager says when the "
             "player walks up and chats.\n"
             "Rules:\n"
             "- 1 to 3 short sentences per line, at most 160 characters.\n"
@@ -1620,8 +1906,7 @@ private:
             "- Base most lines on the reading material: the villager read or heard about these things and "
             "chats about them their own way. Mention them loosely and in-world (\"I read in the paper...\", "
             "\"everyone's talking about...\"). Never include URLs or site names.\n"
-            "- Keep it friendly and gentle. Skip any material that is violent, tragic, sexual, divisive or "
-            "otherwise not for kids, and talk about something else instead.\n"
+            + tone_rules_text() +
             "- Lines are saved and used over the next few days: don't mention today's weather or the time of "
             "day. The season and upcoming holidays are fine.\n"
             "- Lines are said in passing and the conversation ends after them, so don't ask the player a "
@@ -1923,9 +2208,6 @@ ws     ::= [ \t\n]{0,4}
             if (m_config.personalities.count(it->second.personality)) {
                 return { it->second.personality, it->second.notes };
             }
-            if (!it->second.personality.empty()) {
-                Log.warn("Villager {} uses unknown personality '{}'", v.name, it->second.personality);
-            }
             return { m_config.byLooks[std::clamp(v.looks, 0, 5)], it->second.notes };
         }
         return { m_config.byLooks[std::clamp(v.looks, 0, 5)], "" };
@@ -2009,7 +2291,8 @@ ws     ::= [ \t\n]{0,4}
                 situation = it->second;
             }
         }
-        const auto req = msg::rewrite_request(*tpl, pid, pit->second.voice, situation);
+        const auto req = msg::rewrite_request(*tpl, pid, pit->second.voice, situation, m_config.toneSetting,
+                                              tone_rules_text());
         const auto& idx = req.pages;
         const size_t n = idx.size();
         const json schema = {
@@ -2076,6 +2359,95 @@ ws     ::= [ \t\n]{0,4}
         return std::string(days[std::clamp(s.weekday, 0, 6)]) + ", " + time + ", " + weather[std::clamp(s.weather, 0, 4)];
     }
 
+    // How many words of a live line wait before showing, so a refusal can be caught first.
+    static constexpr int kHeldWords = 4;
+    static int word_count(const std::string& s) {
+        return s.empty() ? 0 : 1 + static_cast<int>(std::count(s.begin(), s.end(), ' '));
+    }
+
+    struct Topic {
+        TopicKind kind = TopicKind::Weather;
+        std::string text = "the weather, the time of day or the season right now";
+    };
+
+    // Picks what the next line is about (see "topic_mix"): weighted by kind, never the same kind
+    // twice in a row for a villager, never a topic they had in their last 8 lines, and no
+    // headline reused across villagers for a while. Worker thread.
+    Topic pick_topic(const std::string& villager, const std::string& personalityId, const Personality& p) {
+        constexpr size_t kHistory = 8;
+        constexpr size_t kHeadlineHistory = 40;
+        constexpr const char* kNeighbor = "{neighbor}";
+
+        std::vector<std::string> neighbors;
+        {
+            std::lock_guard lock(m_mutex);
+            for (const auto& [name, info] : m_villagers) {
+                if (name != villager) {
+                    neighbors.push_back(name);
+                }
+            }
+        }
+        auto& history = m_topicHistory[villager];
+        auto used = [&](const std::string& t) {
+            return std::find(history.begin(), history.end(), t) != history.end();
+        };
+
+        std::array<std::vector<std::string>, 4> pools;
+        for (auto& t : cached_material(personalityId)) {
+            if (!used(t) && std::find(m_recentHeadlines.begin(), m_recentHeadlines.end(), t) == m_recentHeadlines.end()) {
+                pools[static_cast<size_t>(TopicKind::News)].push_back(std::move(t));
+            }
+        }
+        for (const auto& t : p.topics) {
+            if (!used(t)) {
+                pools[static_cast<size_t>(TopicKind::Personal)].push_back(t);
+            }
+        }
+        for (const auto& t : m_config.villageTopics) {
+            if (!used(t) && (neighbors.size() > 0 || t.find(kNeighbor) == std::string::npos)) {
+                pools[static_cast<size_t>(TopicKind::Village)].push_back(t);
+            }
+        }
+        pools[static_cast<size_t>(TopicKind::Weather)].push_back(Topic{}.text);
+
+        std::array<int, 4> weights{};
+        int kinds = 0;
+        for (size_t k = 0; k < weights.size(); ++k) {
+            weights[k] = pools[k].empty() ? 0 : m_config.topicMix[k];
+            kinds += weights[k] > 0;
+        }
+        if (auto last = m_lastTopicKind.find(villager); last != m_lastTopicKind.end() && kinds > 1) {
+            weights[static_cast<size_t>(last->second)] = 0;
+        }
+        Topic topic;
+        if (std::accumulate(weights.begin(), weights.end(), 0) > 0) {
+            std::discrete_distribution<size_t> pickKind(weights.begin(), weights.end());
+            const size_t k = pickKind(m_workerRng);
+            std::uniform_int_distribution<size_t> pickItem(0, pools[k].size() - 1);
+            topic.kind = static_cast<TopicKind>(k);
+            topic.text = pools[k][pickItem(m_workerRng)];
+        }
+
+        if (topic.kind != TopicKind::Weather) {
+            history.push_back(topic.text);
+            while (history.size() > kHistory) {
+                history.pop_front();
+            }
+        }
+        if (topic.kind == TopicKind::News) {
+            m_recentHeadlines.push_back(topic.text);
+            while (m_recentHeadlines.size() > kHeadlineHistory) {
+                m_recentHeadlines.pop_front();
+            }
+        }
+        m_lastTopicKind[villager] = topic.kind;
+        if (const size_t at = topic.text.find(kNeighbor); at != std::string::npos && !neighbors.empty()) {
+            std::uniform_int_distribution<size_t> pickNeighbor(0, neighbors.size() - 1);
+            topic.text.replace(at, std::strlen(kNeighbor), neighbors[pickNeighbor(m_workerRng)]);
+        }
+        return topic;
+    }
+
     // Writes one line for the villager the player is talking to, streaming it into
     // m_stream as it's generated. Worker thread.
     void do_live(const LiveRequest& req) {
@@ -2114,19 +2486,48 @@ ws     ::= [ \t\n]{0,4}
             return m_stream.id != req.id || m_stream.cancelled;
         };
 
+        // Quest/event triggers in the message this line replaces still fire (with the first words).
+        const auto original = msg::original(req.msgNo);
+        const std::vector<uint8_t> questCodes = original ? msg::quest_codes(*original) : std::vector<uint8_t>{};
+        // The first few words are held back until it's clear the model isn't refusing.
+        std::vector<uint8_t> held;
+        bool released = false;
+        bool refused = false;
+        auto hold = [&](std::vector<uint8_t> bytes, bool final) {
+            if (refused) {
+                return;
+            }
+            held.insert(held.end(), bytes.begin(), bytes.end());
+            if (!released) {
+                if (!final && word_count(streamer.text()) < kHeldWords) {
+                    return;
+                }
+                if (msg::looks_like_refusal(streamer.text())) {
+                    refused = true;
+                    return;
+                }
+                released = true;
+                held.insert(held.begin(), questCodes.begin(), questCodes.end());
+            }
+            push(std::move(held), false);
+            held.clear();
+        };
         std::optional<std::string> text;
+        Topic topic;
         std::string raw;    // exactly what the model wrote, for the talk log
         std::string prompt; // the per-line part of the prompt (the system prompt never changes)
         if (pit != m_config.personalities.end()) {
-            static const std::string kSystem =
-                "You voice a villager in a cozy, all-ages village life game where the residents are talking "
-                "animals. The player just walked up to chat. Write the one thing the villager says right now: 1 to "
-                "3 short sentences, at most 200 characters.\n"
+            const std::string kSystem =
+                "You voice a villager in " + m_config.toneSetting + ". The player just walked up to chat. Write the one "
+                "thing the villager says right now: usually 1 to 3 sentences, but take what you need to finish the "
+                "thought, never more than " + std::to_string(m_config.maxLineChars - 40) + " characters. Always end on "
+                "a complete sentence.\n"
                 "Rules:\n"
                 "- Stay fully in the villager's voice and personality.\n"
-                "- Talk about the topic you're given, mentioned loosely and in-world (\"I read in the paper...\"), "
-                "or about the weather, time of day, season or village life. Never include URLs or site names.\n"
-                "- Keep it friendly and gentle. Skip anything violent, tragic, sexual, divisive or not for kids.\n"
+                "- Make the topic you're given the subject of the line. The personality shapes how the villager "
+                "talks about it, not what they talk about. Mention news loosely and in-world (\"I read in the "
+                "paper...\"). Never include URLs or site names.\n"
+                + tone_rules_text() +
                 "- Write {player} for the player's name and {catchphrase} for the villager's catchphrase (it "
                 "usually ends a sentence). Never write the catchphrase itself.\n"
                 "- The conversation ends after this line, so don't ask a question that needs an answer.\n"
@@ -2148,14 +2549,14 @@ ws     ::= [ \t\n]{0,4}
             if (scene.valid) {
                 user << "Right now: " << scene_now(scene) << "\n";
             }
-            // A topic from the personality's sources about two times in three, else everyday life.
-            const auto& material = m_material[personalityId].items;
-            std::uniform_int_distribution<int> roll(0, 2);
-            if (!material.empty() && roll(m_workerRng) != 0) {
-                std::uniform_int_distribution<size_t> pick(0, material.size() - 1);
-                user << "Topic: " << material[pick(m_workerRng)] << "\n";
-            } else {
-                user << "Topic: the weather, the time of day or life in the village right now\n";
+            topic = pick_topic(v.name, personalityId, pit->second);
+            switch (topic.kind) {
+            case TopicKind::News:
+                user << "Topic (something they read or heard about): " << topic.text << "\n";
+                break;
+            case TopicKind::Personal: user << "Topic (one of their own interests): " << topic.text << "\n"; break;
+            case TopicKind::Village: user << "Topic (village life): " << topic.text << "\n"; break;
+            default: user << "Topic: " << topic.text << "\n"; break;
             }
             const auto& recent = m_recent[v.name];
             if (!recent.empty()) {
@@ -2167,12 +2568,16 @@ ws     ::= [ \t\n]{0,4}
             user << "\nSay it now.";
 
             // Plain text, one line; the model stops when it's done.
-            static const std::string kGrammar = "root ::= [^\"\\\\*\\x00-\\x1F]{12,220}\n";
+            // Printable ASCII minus quote, asterisk and backslash (the font has no glyphs for most else).
+            const std::string kGrammar = "root ::= [\\x20\\x21\\x23-\\x29\\x2B-\\x5B\\x5D-\\x7E]{12," +
+                                         std::to_string(m_config.maxLineChars) + "}\n";
             prompt = user.str();
-            text = complete("live line for " + v.name, kSystem, prompt, kGrammar, json::object(), 96, 0.9f,
-                            cancelled, [&](std::string_view piece) {
+            // About 4 characters per token in English; leave headroom so the character cap is what stops it.
+            const int maxTokens = m_config.maxLineChars / 3 + 32;
+            text = complete("live line for " + v.name, kSystem, prompt, kGrammar, json::object(), maxTokens, 0.9f,
+                            [&] { return refused || cancelled(); }, [&](std::string_view piece) {
                                 raw.append(piece);
-                                push(streamer.feed(piece), false);
+                                hold(streamer.feed(piece), false);
                             });
         }
 
@@ -2186,6 +2591,7 @@ ws     ::= [ \t\n]{0,4}
                 { "Message", std::to_string(req.msgNo) },
                 { "Personality", personalityId + " (built-in " + kLooksNames[std::clamp(v.looks, 0, 5)] + ", mood " +
                                      mood_name(v.mood) + ")" },
+                { "Topic", std::string(kTopicKindNames[static_cast<size_t>(topic.kind)]) + ": " + topic.text },
                 { "Timing", "first words " + (firstWords ? std::to_string(ms(*firstWords)) + " ms" : std::string("-")) +
                                 ", done " + std::to_string(ms(Clock::now())) + " ms" },
                 { "Prompt", prompt.empty() ? "(none: no personality configured)" : prompt },
@@ -2200,22 +2606,35 @@ ws     ::= [ \t\n]{0,4}
             return;
         }
         std::string outcome = "ok";
-        if (!text || streamer.text().empty()) {
-            // The model failed: say a pooled line instead, or a shrug.
-            outcome = pit == m_config.personalities.end() ? "fallback (no personality for " + v.name + ")"
-                                                          : "fallback (the model failed; see the game log)";
-            std::string fallback = "Oh, hi, {player}! Sorry, I was miles away, {catchphrase}.";
-            {
-                std::lock_guard lock(m_mutex);
-                if (auto& pool = m_pools[v.name]; pools_on() && !pool.empty()) {
-                    fallback = pool.back();
-                    pool.pop_back();
-                    m_cacheDirty = true;
+        if (refused || !text || streamer.text().empty()) {
+            outcome = refused ? "refused by the model; played the game's own line"
+                              : "the model failed (see the game log); played the game's own line";
+            if (!released && original) {
+                // Nothing shown yet: the game's own line plays instead.
+                push(*original, true);
+            } else {
+                std::string fallback = "Oh, hi, {player}! Sorry, I was miles away, {catchphrase}.";
+                {
+                    std::lock_guard lock(m_mutex);
+                    if (auto& pool = m_pools[v.name]; pools_on() && !pool.empty()) {
+                        fallback = pool.back();
+                        pool.pop_back();
+                        m_cacheDirty = true;
+                    }
                 }
+                outcome = "the model failed partway; finished with a stand-in line";
+                hold(streamer.feed(fallback + " "), true);
+                push(streamer.finish(), true);
             }
-            push(streamer.feed(fallback + " "), false);
+        } else {
+            hold(streamer.finish(), true);
+            if (refused && original) {
+                outcome = "refused by the model; played the game's own line";
+                push(*original, true);
+            } else {
+                push({}, true);
+            }
         }
-        push(streamer.finish(), true);
 
         auto& recent = m_recent[v.name];
         recent.push_back(streamer.text());
@@ -2226,12 +2645,228 @@ ws     ::= [ \t\n]{0,4}
         Log.info("Live line for {} ({}): first words after {} ms, done after {} ms: {}", v.name, personalityId,
                  firstWords ? ms(*firstWords) : -1, ms(Clock::now()), streamer.text());
 
-        // Keep the topics fresh between lines (live lines never wait on the network).
-        if (pit != m_config.personalities.end()) {
-            const auto& m = m_material[personalityId];
-            if (m.items.empty() || Clock::now() - m.fetched > std::chrono::minutes(m_config.sourceRefreshMinutes)) {
-                material_for(personalityId, pit->second);
+    }
+
+    // ---- Live rewrites ----
+
+    // Rewrites one message page by page, streaming each page into the text box as it's written.
+    // Every code that does something (choices, branches, quest steps, animations) is kept, and if
+    // the model fails or stalls, the rest of the message plays as the game wrote it. Worker thread.
+    void do_live_rewrite(const LiveRequest& req) {
+        m_preempt = false;
+        const auto started = Clock::now();
+        const RewritePlan& plan = *req.plan;
+        const msg::Template& t = plan.tpl;
+        const size_t n = t.pages.size();
+
+        VillagerInfo v;
+        Scene scene;
+        std::vector<std::string> history;
+        {
+            std::lock_guard lock(m_mutex);
+            v = m_villagers[req.villager];
+            scene = m_scene;
+            if (m_talk.villager == req.villager) {
+                history = m_talk.history;
             }
+        }
+        const auto [personalityId, notes] = resolve_personality(v);
+        const auto pit = m_config.personalities.find(personalityId);
+        const std::string system = msg::live_page_system(m_config.toneSetting, tone_rules_text());
+
+        auto cancelled = [&] {
+            std::lock_guard lock(m_mutex);
+            return m_stream.id != req.id || m_stream.cancelled;
+        };
+        // Appends to the stream; `rescue` is what finishes the message from there if the model stalls.
+        // Returns false if the stream is gone or there's no room left for `bytes` plus the rescue.
+        auto push = [&](const std::vector<uint8_t>& bytes, std::vector<uint8_t> rescue, bool done) {
+            std::lock_guard lock(m_mutex);
+            if (m_stream.id != req.id || m_stream.cancelled) {
+                return false;
+            }
+            if (m_stream.bytes.size() + bytes.size() + rescue.size() + 2 > plan.bufSize) {
+                return false;
+            }
+            m_stream.bytes.insert(m_stream.bytes.end(), bytes.begin(), bytes.end());
+            m_stream.rescue = std::move(rescue);
+            m_stream.lastProgress = Clock::now();
+            m_stream.done = done;
+            return true;
+        };
+        auto concat = [](std::vector<uint8_t> a, const std::vector<uint8_t>& b) {
+            a.insert(a.end(), b.begin(), b.end());
+            return a;
+        };
+        // What follows page i's words: its trailing codes, then the rest as the game wrote it.
+        auto after_words = [&](size_t i) {
+            if (i + 1 < n) {
+                return concat(concat(t.pages[i].trail, t.separators[i]), msg::original_from(t, i + 1));
+            }
+            return concat(t.pages[i].trail, t.tail);
+        };
+        // What follows page i entirely.
+        auto after_page = [&](size_t i) {
+            return i + 1 < n ? concat(t.separators[i], msg::original_from(t, i + 1)) : t.tail;
+        };
+
+        struct PageLog {
+            std::string original, wrote, shown;
+        };
+        std::vector<PageLog> pageLogs;
+        std::string outcome = "ok";
+        std::optional<Clock::time_point> firstWords;
+        bool marked = false;
+        bool finished = false;
+
+        for (size_t i = 0; i < n && !finished; ++i) {
+            const msg::Page& page = t.pages[i];
+            if (i > 0 && !push(t.separators[i - 1], msg::original_from(t, i), false)) {
+                break;
+            }
+            if (!page.rewritable) {
+                const bool last = i + 1 == n;
+                if (!push(concat(page.original, last ? t.tail : std::vector<uint8_t>{}), last ? std::vector<uint8_t>{}
+                                                                                              : after_page(i), last)) {
+                    break;
+                }
+                pageLogs.push_back({ page.text, "(kept: can't be reworded safely)", page.text });
+                continue;
+            }
+
+            std::ostringstream ctx;
+            ctx << "Villager: " << v.name << "\n"
+                << "Built-in temperament: " << kLooksNames[std::clamp(v.looks, 0, 5)] << "\n"
+                << "Current mood: " << mood_name(v.mood) << "\n";
+            if (!v.catchphrase.empty()) {
+                ctx << "Their catchphrase (write it as {catchphrase}): " << v.catchphrase << "\n";
+            }
+            if (pit != m_config.personalities.end()) {
+                ctx << "Personality (" << personalityId << "): " << pit->second.voice << "\n";
+            }
+            if (!notes.empty()) {
+                ctx << "Extra notes about this villager: " << notes << "\n";
+            }
+            if (scene.valid) {
+                ctx << "Right now: " << scene_now(scene) << "\n";
+            }
+            if (!plan.situation.empty()) {
+                ctx << "What's going on: " << plan.situation << "\n";
+            }
+            if (!history.empty()) {
+                ctx << "Already said earlier in this conversation (it's already on screen; don't repeat any of "
+                       "it, just carry on from it):\n";
+                for (size_t h = history.size() > 4 ? history.size() - 4 : 0; h < history.size(); ++h) {
+                    ctx << "- " << history[h] << "\n";
+                }
+            }
+            if (n > 1) {
+                ctx << "This is page " << (i + 1) << " of " << n << " of what they're saying now.\n";
+            }
+            const auto pageReq = msg::live_page_request(page, system, ctx.str());
+
+            msg::PageResolver resolver{ &page, &plan_width, const_cast<RewritePlan*>(&plan) };
+            msg::LineStreamer streamer(&msg::resolve_page_placeholder, &resolver);
+            streamer.drop_leading(v.name + ":");
+            if (m_config.markGenerated && !marked) {
+                streamer.set_marker(kGeneratedMarker);
+                marked = true;
+            }
+            std::string raw;
+            bool leadSent = false;
+            bool noRoom = false;
+            bool refused = false;
+            std::vector<uint8_t> held; // the first few words wait until it's clear the model isn't refusing
+            auto sendWords = [&](std::vector<uint8_t> bytes, bool final) {
+                if (noRoom || refused) {
+                    return;
+                }
+                held.insert(held.end(), bytes.begin(), bytes.end());
+                if (!leadSent) {
+                    if (!final && word_count(streamer.text()) < kHeldWords) {
+                        return;
+                    }
+                    if (msg::looks_like_refusal(streamer.text())) {
+                        refused = true;
+                        return;
+                    }
+                }
+                bytes = std::move(held);
+                held.clear();
+                if (bytes.empty()) {
+                    return;
+                }
+                if (!leadSent) {
+                    bytes.insert(bytes.begin(), page.lead.begin(), page.lead.end());
+                }
+                if (push(bytes, after_words(i), false)) {
+                    leadSent = true;
+                    if (!firstWords) {
+                        firstWords = Clock::now();
+                    }
+                } else if (!cancelled()) {
+                    noRoom = true;
+                }
+            };
+            const auto text = complete("live rewrite of message " + std::to_string(plan.msgNo) + " page " +
+                                           std::to_string(i + 1) + " for " + v.name,
+                                       system, pageReq.user, pageReq.grammar, json::object(), pageReq.maxTokens, 0.6f,
+                                       [&] { return noRoom || refused || cancelled(); },
+                                       [&](std::string_view piece) {
+                                           raw.append(piece);
+                                           sendWords(streamer.feed(piece), false);
+                                       });
+            if (cancelled()) {
+                outcome = "cancelled (the player moved on)";
+                pageLogs.push_back({ page.text, raw, streamer.text() });
+                finished = true;
+                break;
+            }
+            if (!noRoom && !refused && text && !streamer.text().empty()) {
+                sendWords(streamer.finish(/*endMessage=*/false), true);
+            }
+            pageLogs.push_back({ page.text, raw.empty() ? "(nothing)" : raw, leadSent ? streamer.text() : "(not shown)" });
+            if (noRoom || refused || !text || !leadSent) {
+                // Out of buffer, refused or failed: the rest plays as the game wrote it.
+                outcome = std::string(noRoom ? "ran out of message space" : refused ? "the model refused" : "the model failed") +
+                          " on page " + std::to_string(i + 1) + "; the rest played as the game wrote it";
+                push(leadSent ? after_words(i) : msg::original_from(t, i), {}, true);
+                finished = true;
+                break;
+            }
+            const bool last = i + 1 == n;
+            if (!push(concat(page.trail, last ? t.tail : std::vector<uint8_t>{}), last ? std::vector<uint8_t>{}
+                                                                                       : after_page(i), last)) {
+                break;
+            }
+            // Later messages of this conversation see this page; later pages of this message don't
+            // (the model copies earlier pages it can see, and the game's page order carries the flow).
+            std::lock_guard lock(m_mutex);
+            if (m_talk.villager == req.villager) {
+                m_talk.history.push_back(streamer.text());
+            }
+        }
+
+        if (m_talkLog.enabled()) {
+            auto ms = [&](Clock::time_point tp) {
+                return std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(tp - started).count()) + " ms";
+            };
+            std::vector<std::pair<std::string, std::string>> fields = {
+                { "Outcome", outcome },
+                { "Message", std::to_string(plan.msgNo) },
+                { "Personality", personalityId + " (built-in " + kLooksNames[std::clamp(v.looks, 0, 5)] + ")" },
+                { "Situation", plan.situation.empty() ? "(unknown)" : plan.situation },
+                { "Timing", "first words " + (firstWords ? ms(*firstWords) : std::string("-")) + ", done " +
+                                ms(Clock::now()) },
+            };
+            for (size_t k = 0; k < pageLogs.size(); ++k) {
+                const std::string p = "Page " + std::to_string(k + 1);
+                fields.push_back({ p + " original", pageLogs[k].original });
+                fields.push_back({ p + " model wrote", pageLogs[k].wrote });
+                fields.push_back({ p + " shown", pageLogs[k].shown });
+            }
+            fields.push_back({ "Full original", original_text(plan.msgNo) });
+            m_talkLog.write("LIVE REWRITE  " + v.name, fields);
         }
     }
 
@@ -2397,7 +3032,9 @@ ws     ::= [ \t\n]{0,4}
             switch (job.kind) {
             case Job::Kind::None: save_cache(); break;
             case Job::Kind::Live:
-                if (live) {
+                if (live && live->plan) {
+                    do_live_rewrite(*live);
+                } else if (live) {
                     do_live(*live);
                 }
                 break;
@@ -2423,7 +3060,12 @@ ws     ::= [ \t\n]{0,4}
     bool m_cacheDirty = false;
     std::map<std::string, VillagerInfo> m_villagers;
     std::map<std::string, std::vector<std::string>> m_pools;
-    std::map<std::string, Material> m_material; // worker thread only
+    std::thread m_fetcher;
+    std::mutex m_fetchMutex;
+    std::condition_variable m_fetchCv;
+    bool m_fetchWake = false;                   // guarded by m_fetchMutex
+    std::mutex m_materialMutex;
+    std::map<std::string, Material> m_material; // guarded by m_materialMutex
     std::optional<Armed> m_armed;
     Stream m_stream;                  // guarded by m_mutex
     uint64_t m_streamCounter = 0;     // guarded by m_mutex
@@ -2433,13 +3075,16 @@ ws     ::= [ \t\n]{0,4}
     std::filesystem::path m_dir;
     bool m_embeddedReady = false;  // worker thread only
     bool m_embeddedFailed = false; // worker thread only
-    bool m_redditBlocked = false;  // worker thread only
+    bool m_redditBlocked = false;  // fetcher thread only
     std::atomic<bool> m_liveReady{ false }; // lines can be written live (model loaded, option on)
     enum class ModelState { Loading, Ready, Failed };
     std::atomic<ModelState> m_modelState{ ModelState::Loading };
     TalkLog m_talkLog;
     std::atomic<bool> m_preempt{ false };   // a live line is waiting: background requests stop
     std::map<std::string, std::deque<std::string>> m_recent; // worker only: last live lines per villager
+    std::map<std::string, std::deque<std::string>> m_topicHistory; // worker only: last topics per villager
+    std::map<std::string, TopicKind> m_lastTopicKind;               // worker only
+    std::deque<std::string> m_recentHeadlines;                      // worker only: across all villagers
 
     // Guarded by m_mutex:
     std::array<std::vector<int>, 6> m_roots; // conversation openers per built-in personality
@@ -2503,6 +3148,8 @@ void pc_dialog_begin_talk(const PCDialogVillager* villager, const void* actor, c
 
 void pc_dialog_end_talk(void) { acgc::dialog::service().end_talk(); }
 
+void pc_dialog_start(void) { acgc::dialog::service().ensure_started(); }
+
 void pc_dialog_note_talk(int msg_no, const char* kind) { acgc::dialog::service().note_talk(msg_no, kind); }
 
 void pc_dialog_register_roots(int looks, const char* situation, const int* msg_nos, int count) {
@@ -2511,7 +3158,7 @@ void pc_dialog_register_roots(int looks, const char* situation, const int* msg_n
 
 int pc_dialog_rewrite(int msg_no, const void* speaker_actor, uint8_t* dst, int dst_size) {
     if (dst == nullptr || dst_size <= 0) {
-        return 0;
+        return -1;
     }
     return acgc::dialog::service().rewrite(msg_no, speaker_actor, dst, dst_size);
 }
