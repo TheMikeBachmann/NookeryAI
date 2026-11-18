@@ -93,6 +93,8 @@ public:
     bool empty() const { return m_linesOnPage == 0; }
     // Drops the first word if it's exactly this (a model starting with "Bill:").
     void drop_leading(std::string word) { m_dropLeading = std::move(word); }
+    // A game character put in front of the first word (not part of text()).
+    void set_marker(uint8_t code) { m_marker = code; }
     // The text committed so far (UTF-8), for logs and history.
     const std::string& text() const { return m_text; }
 
@@ -104,6 +106,7 @@ private:
     std::string m_pending;
     std::string m_dropLeading;
     std::string m_text;
+    int m_marker = -1;
     int m_lineWidth = 0;
     int m_linesOnPage = 0; // 0 = nothing written yet
 };

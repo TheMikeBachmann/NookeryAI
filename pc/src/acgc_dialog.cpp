@@ -84,6 +84,9 @@ constexpr uint8_t kCharSpace = 0x20;
 constexpr uint8_t kContLast = 0x00;       // end of message
 constexpr uint8_t kContPlayerName = 0x1A; // mFont_CONT_CODE_PUT_STRING_PLAYER_NAME
 constexpr uint8_t kContTail = 0x1C;       // mFont_CONT_CODE_PUT_STRING_TAIL (catchphrase)
+// Shown in front of every generated line (mark_generated) so it can be told apart from the game's
+// own text. CHAR_SYMBOL_STAR: the font has no '*', and model text can never encode to this code.
+constexpr uint8_t kGeneratedMarker = 185;
 
 constexpr const char* kUserAgent = "Nookery-VillagerDialog/1.0";
 constexpr const char* kAnthropicUrl = "https://api.anthropic.com/v1/messages";
@@ -144,8 +147,11 @@ struct Config {
     int linesPerBatch = 12;
     int minPool = 8;     // refill a villager urgently below this
     int poolTarget = 24; // keep topping up to this when nothing else needs doing
-    bool rewriteSpecial = true;
-    bool liveSmallTalk = true; // write small talk as the player talks, streamed into the text box
+    bool rewriteSpecial = false;   // off for now: phase 1 is chit-chat only
+    bool liveSmallTalk = true;     // write small talk as the player talks, streamed into the text box
+    bool prewriteSmallTalk = false; // also keep pools of pre-written lines (fallback / non-embedded providers)
+    bool talkLog = true;           // record every chit-chat line in dialog/talk_log.txt
+    bool markGenerated = true;     // put a star in front of generated lines, for testing
     int sourceRefreshMinutes = 60;
     std::map<std::string, Personality> personalities;
     std::array<std::string, 6> byLooks;
@@ -215,8 +221,11 @@ json default_config_json() {
         { "lines_per_batch", 12 },
         { "min_pool", 8 },
         { "pool_target", 24 },
-        { "rewrite_special", true },
+        { "rewrite_special", false },
         { "live_small_talk", true },
+        { "prewrite_small_talk", false },
+        { "talk_log", true },
+        { "mark_generated", true },
         { "source_refresh_minutes", 60 },
         { "personalities", personalities },
         { "by_builtin_type",
@@ -297,6 +306,9 @@ Config parse_config(const json& j) {
     c.poolTarget = std::clamp(j.value("pool_target", c.poolTarget), c.minPool, 200);
     c.rewriteSpecial = j.value("rewrite_special", c.rewriteSpecial);
     c.liveSmallTalk = j.value("live_small_talk", c.liveSmallTalk);
+    c.prewriteSmallTalk = j.value("prewrite_small_talk", c.prewriteSmallTalk);
+    c.talkLog = j.value("talk_log", c.talkLog);
+    c.markGenerated = j.value("mark_generated", c.markGenerated);
     c.sourceRefreshMinutes = std::max(5, j.value("source_refresh_minutes", c.sourceRefreshMinutes));
 
     if (auto it = j.find("personalities"); it != j.end() && it->is_object()) {
@@ -515,8 +527,16 @@ bool resolve_chitchat(const std::string& key, std::vector<uint8_t>& bytes, int& 
 // {player} and {catchphrase} become the game's own name/catchphrase codes; their
 // widths are measured from the real strings so wrapping stays correct.
 std::vector<uint8_t> encode_message(const std::string& utf8, const std::vector<uint8_t>& playerName,
-                                    const std::vector<uint8_t>& catchphrase) {
+                                    const std::vector<uint8_t>& catchphrase, bool marked) {
     Names names{ playerName, catchphrase };
+    if (marked) {
+        msg::LineStreamer streamer(&resolve_chitchat, &names);
+        streamer.set_marker(kGeneratedMarker);
+        auto out = streamer.feed(utf8 + " ");
+        const auto rest = streamer.finish();
+        out.insert(out.end(), rest.begin(), rest.end());
+        return out;
+    }
     auto out = msg::paginate(msg::wrap_text(utf8, &resolve_chitchat, &names));
     out.insert(out.end(), { kCharControl, kContLast });
     return out;
@@ -823,6 +843,74 @@ struct Rewrite {
 using StopFn = std::function<bool()>;
 using PieceFn = std::function<void(std::string_view)>;
 
+// dialog/talk_log.txt: one readable entry per chit-chat line, for bug testing.
+// Appended from both threads; each entry is written and flushed whole.
+class TalkLog {
+public:
+    void open(const std::filesystem::path& path) {
+        std::lock_guard lock(m_mutex);
+        std::error_code ec;
+        if (std::filesystem::file_size(path, ec) > kMaxBytes && !ec) {
+            auto old = path;
+            old.replace_extension(".old.txt");
+            std::filesystem::rename(path, old, ec);
+        }
+        m_out.open(path, std::ios::app);
+        if (!m_out) {
+            Log.warn("Could not open {} for writing", path.string());
+        }
+    }
+
+    bool enabled() {
+        std::lock_guard lock(m_mutex);
+        return m_out.is_open();
+    }
+
+    // `title` heads the entry; `fields` are "Label: value" lines (multi-line values are indented).
+    void write(const std::string& title, const std::vector<std::pair<std::string, std::string>>& fields) {
+        std::lock_guard lock(m_mutex);
+        if (!m_out) {
+            return;
+        }
+        m_out << "\n[" << timestamp() << "] " << title << "\n";
+        for (const auto& [label, value] : fields) {
+            if (value.find('\n') == std::string::npos) {
+                m_out << "  " << label << ": " << value << "\n";
+                continue;
+            }
+            m_out << "  " << label << ":\n";
+            std::istringstream lines(value);
+            for (std::string line; std::getline(lines, line);) {
+                m_out << "    " << line << "\n";
+            }
+        }
+        m_out.flush();
+    }
+
+private:
+    static constexpr uintmax_t kMaxBytes = 8u << 20; // start over (keeping one old file) past 8 MB
+
+    static std::string timestamp() {
+        const auto now = std::chrono::system_clock::now();
+        const std::time_t t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm{};
+#if defined(_WIN32)
+        localtime_s(&tm, &t);
+#else
+        localtime_r(&t, &tm);
+#endif
+        const auto ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
+        char buf[40];
+        std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%03d", tm.tm_year + 1900, tm.tm_mon + 1,
+                      tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, static_cast<int>(ms));
+        return buf;
+    }
+
+    std::mutex m_mutex;
+    std::ofstream m_out;
+};
+
 struct Job {
     enum class Kind { None, Live, Chat, Rewrite } kind = Kind::None;
     std::string villager;    // Chat
@@ -840,6 +928,15 @@ public:
             load_config();
             load_cache();
             load_rewrites();
+            if (m_config.enabled && m_config.talkLog) {
+                m_talkLog.open(dir() / "talk_log.txt");
+                m_talkLog.write("SESSION START", {
+                    { "Provider", provider_name() },
+                    { "Live small talk", m_config.liveSmallTalk ? "on" : "off" },
+                    { "Pre-written small talk", pools_on() ? "on" : "off" },
+                    { "Rewrites of other messages", m_config.rewriteSpecial ? "on" : "off" },
+                });
+            }
             if (m_config.enabled) {
                 m_worker = std::thread([this] { run(); });
             }
@@ -879,15 +976,16 @@ public:
                 m_stream = Stream{};
                 m_stream.id = ++m_streamCounter;
                 m_stream.lastProgress = Clock::now();
-                m_live = LiveRequest{ m_stream.id, name, m_talk.names };
+                m_live = LiveRequest{ m_stream.id, name, m_talk.names, msgNo };
                 m_preempt = true; // background work yields to this
                 m_armed = Armed{ msgNo, {}, m_stream.id };
                 m_cv.notify_all();
                 return true;
             }
             auto it = m_pools.find(name);
-            if (it == m_pools.end() || it->second.empty()) {
+            if (!pools_on() || it == m_pools.end() || it->second.empty()) {
                 m_armed.reset();
+                log_original_locked(msgNo, name);
                 return false;
             }
             auto& pool = it->second;
@@ -906,7 +1004,14 @@ public:
         std::vector<uint8_t> catchphrase(v.catchphrase,
                                          v.catchphrase + std::clamp(v.catchphrase_len, 0, PC_DIALOG_CATCHPHRASE_LEN));
         std::lock_guard lock(m_mutex);
-        m_armed = Armed{ msgNo, encode_message(line, playerName, catchphrase) };
+        m_armed = Armed{ msgNo, encode_message(line, playerName, catchphrase, m_config.markGenerated) };
+        if (m_talkLog.enabled()) {
+            m_talkLog.write("PRE-WRITTEN LINE  " + name, {
+                { "Message", std::to_string(msgNo) },
+                { "Shown", line },
+                { "Replaces", original_text(msgNo) },
+            });
+        }
         return true;
     }
 
@@ -934,6 +1039,19 @@ public:
             m_scene = Scene{ true, scene->weather, scene->month, scene->day, scene->weekday, scene->hour, scene->minute };
         }
         m_cv.notify_all();
+    }
+
+    void note_talk(int msgNo, const char* kind) {
+        std::string villager;
+        {
+            std::lock_guard lock(m_mutex);
+            villager = m_talk.villager;
+        }
+        m_talkLog.write("OTHER LINE  " + villager, {
+            { "Message", std::to_string(msgNo) },
+            { "Kind", kind != nullptr ? kind : "unknown" },
+            { "Text", original_text(msgNo) },
+        });
     }
 
     void end_talk() {
@@ -1070,6 +1188,10 @@ public:
         }
         if (Clock::now() - m_stream.lastProgress > std::chrono::seconds(10)) {
             Log.warn("Live line stalled; ending it");
+            m_talkLog.write("STALLED  stream " + std::to_string(m_stream.id), {
+                { "Detail", "no new words for 10 s while the text box was waiting; line ended early" },
+                { "Bytes shown", std::to_string(m_stream.delivered) },
+            });
             endNow();
             return 0;
         }
@@ -1099,7 +1221,50 @@ private:
         uint64_t id = 0;
         std::string villager;
         Names names;
+        int msgNo = -1; // the game's chit-chat message this line replaces
     };
+
+    // Pre-written pools are used when asked for, and always for providers that can't write live.
+    bool pools_on() const { return m_config.prewriteSmallTalk || m_config.provider != Provider::Embedded; }
+
+    const char* provider_name() const {
+        return m_config.provider == Provider::Embedded ? "embedded (llama.cpp, GPU)"
+               : m_config.provider == Provider::Local  ? "local server"
+                                                       : "anthropic";
+    }
+
+    // The game's own text for a message, readable, for the talk log.
+    static std::string original_text(int msgNo) {
+        if (!msg::available()) {
+            return "(message archive not loaded)";
+        }
+        const auto bytes = msg::original(msgNo);
+        return bytes ? msg::describe(*bytes) : "(no such message)";
+    }
+
+    // Why a chit-chat message played as the game wrote it. m_mutex held.
+    void log_original_locked(int msgNo, const std::string& villager) {
+        if (!m_talkLog.enabled()) {
+            return;
+        }
+        std::string why;
+        if (m_config.provider == Provider::Embedded && !m_config.liveSmallTalk) {
+            why = "live_small_talk is off";
+        } else if (m_config.provider == Provider::Embedded && m_modelState == ModelState::Failed) {
+            why = "the model failed to load (see the game log)";
+        } else if (m_config.provider == Provider::Embedded && !m_liveReady) {
+            why = "the model is still loading";
+        } else if (!m_talk.active || m_talk.villager != villager) {
+            why = "no conversation was started with this villager";
+        } else {
+            why = "no pre-written line ready";
+        }
+        m_talkLog.write("ORIGINAL LINE  " + villager, {
+            { "Message", std::to_string(msgNo) },
+            { "Why", why },
+            { "Text", original_text(msgNo) },
+        });
+    }
 
     const std::filesystem::path& dir() const { return m_dir; }
 
@@ -1557,12 +1722,17 @@ ws     ::= [ \t\n]{0,4}
             }
         } else if (auto found = llm::find_ollama_model(m_config.embeddedOllamaModel)) {
             model = *found;
+        } else if (auto dropped = first_gguf(dir() / "models")) {
+            model = *dropped;
         } else {
-            Log.error("No model for the embedded provider: set embedded.model_path to a .gguf file, or pull "
-                      "'{}' with Ollama so it can be reused",
-                      m_config.embeddedOllamaModel);
+            Log.error("No model for the embedded provider: set embedded.model_path to a .gguf file, put one in "
+                      "{}, or pull '{}' with Ollama so it can be reused",
+                      (dir() / "models").string(), m_config.embeddedOllamaModel);
+            m_modelState = ModelState::Failed;
+            m_talkLog.write("MODEL NOT FOUND", { { "Detail", "no .gguf in dialog/models/ and none configured" } });
             return false;
         }
+        const auto loadStarted = Clock::now();
         std::string error;
         llm::Options options;
         options.model = model;
@@ -1571,6 +1741,8 @@ ws     ::= [ \t\n]{0,4}
         options.threads = m_config.embeddedThreads;
         if (!llm::load(options, error)) {
             Log.error("Embedded model failed to load: {}", error);
+            m_modelState = ModelState::Failed;
+            m_talkLog.write("MODEL FAILED TO LOAD", { { "Model", model.string() }, { "Error", error } });
             return false;
         }
         m_embeddedReady = true;
@@ -1578,11 +1750,35 @@ ws     ::= [ \t\n]{0,4}
         // The GPU's first run is slow (shader setup); get it out of the way now.
         std::string warmError;
         llm::generate("You are a villager.", "Say hi.", "root ::= [a-z ]{1,8}\n", 4, 0.5f, {}, warmError);
+        m_modelState = ModelState::Ready;
         m_liveReady = m_config.liveSmallTalk;
+        m_talkLog.write("MODEL READY", {
+            { "Model", model.string() },
+            { "GPU layers", m_config.embeddedGpuLayers < 0 ? "all" : std::to_string(m_config.embeddedGpuLayers) },
+            { "Context", std::to_string(m_config.embeddedContext) + " tokens" },
+            { "Load + warm-up", std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                   Clock::now() - loadStarted).count()) + " ms" },
+        });
         return true;
 #else
         return false;
 #endif
+    }
+
+    // The first .gguf in `folder` (by name), so a model can just be dropped into dialog/models/.
+    static std::optional<std::filesystem::path> first_gguf(const std::filesystem::path& folder) {
+        std::error_code ec;
+        std::vector<std::filesystem::path> found;
+        for (const auto& e : std::filesystem::directory_iterator(folder, ec)) {
+            if (e.is_regular_file(ec) && e.path().extension() == ".gguf") {
+                found.push_back(e.path());
+            }
+        }
+        if (found.empty()) {
+            return std::nullopt;
+        }
+        std::sort(found.begin(), found.end());
+        return found.front();
     }
 
     // Runs llama.cpp in-process, grammar-constrained.
@@ -1897,6 +2093,9 @@ ws     ::= [ \t\n]{0,4}
 
         msg::LineStreamer streamer(&resolve_chitchat, const_cast<Names*>(&req.names));
         streamer.drop_leading(v.name + ":");
+        if (m_config.markGenerated) {
+            streamer.set_marker(kGeneratedMarker);
+        }
         std::optional<Clock::time_point> firstWords;
         auto push = [&](std::vector<uint8_t> bytes, bool done) {
             std::lock_guard lock(m_mutex);
@@ -1916,6 +2115,8 @@ ws     ::= [ \t\n]{0,4}
         };
 
         std::optional<std::string> text;
+        std::string raw;    // exactly what the model wrote, for the talk log
+        std::string prompt; // the per-line part of the prompt (the system prompt never changes)
         if (pit != m_config.personalities.end()) {
             static const std::string kSystem =
                 "You voice a villager in a cozy, all-ages village life game where the residents are talking "
@@ -1967,19 +2168,46 @@ ws     ::= [ \t\n]{0,4}
 
             // Plain text, one line; the model stops when it's done.
             static const std::string kGrammar = "root ::= [^\"\\\\*\\x00-\\x1F]{12,220}\n";
-            text = complete("live line for " + v.name, kSystem, user.str(), kGrammar, json::object(), 96, 0.9f,
-                            cancelled, [&](std::string_view piece) { push(streamer.feed(piece), false); });
+            prompt = user.str();
+            text = complete("live line for " + v.name, kSystem, prompt, kGrammar, json::object(), 96, 0.9f,
+                            cancelled, [&](std::string_view piece) {
+                                raw.append(piece);
+                                push(streamer.feed(piece), false);
+                            });
         }
 
+        auto ms = [&](Clock::time_point t) { return std::chrono::duration_cast<std::chrono::milliseconds>(t - started).count(); };
+        auto logLine = [&](const std::string& outcome) {
+            if (!m_talkLog.enabled()) {
+                return;
+            }
+            m_talkLog.write("LIVE LINE  " + v.name, {
+                { "Outcome", outcome },
+                { "Message", std::to_string(req.msgNo) },
+                { "Personality", personalityId + " (built-in " + kLooksNames[std::clamp(v.looks, 0, 5)] + ", mood " +
+                                     mood_name(v.mood) + ")" },
+                { "Timing", "first words " + (firstWords ? std::to_string(ms(*firstWords)) + " ms" : std::string("-")) +
+                                ", done " + std::to_string(ms(Clock::now())) + " ms" },
+                { "Prompt", prompt.empty() ? "(none: no personality configured)" : prompt },
+                { "Model wrote", raw.empty() ? "(nothing)" : raw },
+                { "Shown", streamer.text().empty() ? "(nothing)" : streamer.text() },
+                { "Replaces", original_text(req.msgNo) },
+            });
+        };
+
         if (cancelled()) {
+            logLine("cancelled (the player moved on before the line finished)");
             return;
         }
+        std::string outcome = "ok";
         if (!text || streamer.text().empty()) {
             // The model failed: say a pooled line instead, or a shrug.
+            outcome = pit == m_config.personalities.end() ? "fallback (no personality for " + v.name + ")"
+                                                          : "fallback (the model failed; see the game log)";
             std::string fallback = "Oh, hi, {player}! Sorry, I was miles away, {catchphrase}.";
             {
                 std::lock_guard lock(m_mutex);
-                if (auto& pool = m_pools[v.name]; !pool.empty()) {
+                if (auto& pool = m_pools[v.name]; pools_on() && !pool.empty()) {
                     fallback = pool.back();
                     pool.pop_back();
                     m_cacheDirty = true;
@@ -1994,7 +2222,7 @@ ws     ::= [ \t\n]{0,4}
         while (recent.size() > 6) {
             recent.pop_front();
         }
-        auto ms = [&](Clock::time_point t) { return std::chrono::duration_cast<std::chrono::milliseconds>(t - started).count(); };
+        logLine(outcome);
         Log.info("Live line for {} ({}): first words after {} ms, done after {} ms: {}", v.name, personalityId,
                  firstWords ? ms(*firstWords) : -1, ms(Clock::now()), streamer.text());
 
@@ -2047,6 +2275,9 @@ ws     ::= [ \t\n]{0,4}
         job = {};
         const auto now = Clock::now();
         auto chatNeeded = [&](const std::string& name, int below) {
+            if (!pools_on()) {
+                return false; // chit-chat is only written live, on demand
+            }
             auto it = m_villagers.find(name);
             return it != m_villagers.end() && now >= it->second.retryAfter &&
                    m_pools[name].size() < static_cast<size_t>(below);
@@ -2204,6 +2435,9 @@ ws     ::= [ \t\n]{0,4}
     bool m_embeddedFailed = false; // worker thread only
     bool m_redditBlocked = false;  // worker thread only
     std::atomic<bool> m_liveReady{ false }; // lines can be written live (model loaded, option on)
+    enum class ModelState { Loading, Ready, Failed };
+    std::atomic<ModelState> m_modelState{ ModelState::Loading };
+    TalkLog m_talkLog;
     std::atomic<bool> m_preempt{ false };   // a live line is waiting: background requests stop
     std::map<std::string, std::deque<std::string>> m_recent; // worker only: last live lines per villager
 
@@ -2268,6 +2502,8 @@ void pc_dialog_begin_talk(const PCDialogVillager* villager, const void* actor, c
 }
 
 void pc_dialog_end_talk(void) { acgc::dialog::service().end_talk(); }
+
+void pc_dialog_note_talk(int msg_no, const char* kind) { acgc::dialog::service().note_talk(msg_no, kind); }
 
 void pc_dialog_register_roots(int looks, const char* situation, const int* msg_nos, int count) {
     acgc::dialog::service().register_roots(looks, situation, msg_nos, count);

@@ -18,6 +18,8 @@
 /* Set when the chosen message is plain small talk (no trade/quest/letter/event logic),
  * so it is safe to replace with generated dialog. */
 static int l_pc_dialog_chitchat;
+/* What kind of opener was picked when it isn't small talk, for the talk log. */
+static const char* l_pc_dialog_kind;
 #endif
 
 static int aQMgr_decide_msg_trade(QUEST_MANAGER_ACTOR* manager, int looks);
@@ -2317,9 +2319,17 @@ static void aQMgr_talk_normal_select_talk(QUEST_MANAGER_ACTOR* manager) {
     aQMgr_normal_set_free_str(manager);
 #ifdef TARGET_PC
     l_pc_dialog_chitchat = FALSE;
+    l_pc_dialog_kind = "not small talk (a trade, letter, memory, event, tip or similar)";
 #endif
 
     if (!mLd_PlayerManKindCheck() && ((mEv_CheckFirstJob() == TRUE && !mEv_CheckEvent(player_event)) || mPr_CheckFirstJobHint(Now_Private) != TRUE)) {
+#ifdef TARGET_PC
+        if (mEv_CheckFirstJob() == TRUE && !mEv_CheckEvent(player_event)) {
+            l_pc_dialog_kind = "first-job hint (every talk is one while the player works for Nook)";
+        } else {
+            l_pc_dialog_kind = "first-job hint (every talk is one until the player has heard 10)";
+        }
+#endif
         msg_no = aQMgr_decide_fj_hint_msg_no(looks);
         mPr_AddFirstJobHint(Now_Private);
     } else {
@@ -2332,8 +2342,12 @@ static void aQMgr_talk_normal_select_talk(QUEST_MANAGER_ACTOR* manager) {
 
     manager->msg_no = aQMgr_change_NG_msg(msg_no);
 #ifdef TARGET_PC
-    if (aQMgr_pc_dialog_begin(client, animal) && l_pc_dialog_chitchat) {
-        aQMgr_pc_dialog_apply(manager, animal);
+    if (aQMgr_pc_dialog_begin(client, animal)) {
+        if (l_pc_dialog_chitchat) {
+            aQMgr_pc_dialog_apply(manager, animal);
+        } else {
+            pc_dialog_note_talk(manager->msg_no, l_pc_dialog_kind);
+        }
     }
 #endif
     mMsg_SET_CONTINUE_MSG_NUM(manager->msg_no);

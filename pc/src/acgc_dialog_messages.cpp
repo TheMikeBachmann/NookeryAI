@@ -758,6 +758,10 @@ void LineStreamer::commit_word(const std::string& word, std::vector<uint8_t>& ou
     if (bytes.empty()) {
         return;
     }
+    if (m_linesOnPage == 0 && m_marker >= 0) {
+        bytes.insert(bytes.begin(), static_cast<uint8_t>(m_marker));
+        width += mFont_GetCodeWidth(static_cast<uint8_t>(m_marker), 1);
+    }
     const int spaceWidth = mFont_GetCodeWidth(kCharSpace, 1);
     if (m_linesOnPage == 0) {
         m_linesOnPage = 1;

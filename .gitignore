@@ -51,3 +51,9 @@ dist/
 
 # Local CMake presets
 CMakeUserPresets.json
+
+# Disc images
+*.iso
+*.rvz
+*.ciso
+*.gcm

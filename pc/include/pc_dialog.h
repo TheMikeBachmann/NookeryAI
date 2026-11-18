@@ -84,6 +84,12 @@ typedef struct {
 void pc_dialog_begin_talk(const PCDialogVillager* villager, const void* actor, const PCDialogScene* scene,
                           const uint8_t* player_name, int player_name_len);
 
+/*
+ * Called when a conversation started with a message that isn't replaced (not small talk),
+ * so the talk log shows every conversation. `kind` says what it is, in plain English.
+ */
+void pc_dialog_note_talk(int msg_no, const char* kind);
+
 /* Called when the message window lets go of its speaker. */
 void pc_dialog_end_talk(void);
 

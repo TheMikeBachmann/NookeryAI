@@ -99,6 +99,20 @@ else ()
 endif ()
 option(NOOKERY_EMBEDDED_LLM "Build llama.cpp into the game for villager dialog" ${_nookery_llm_default})
 if (NOOKERY_EMBEDDED_LLM)
+    # ggml-vulkan needs SPIRV-Headers; fetch them when the system has none (e.g. SteamOS).
+    find_package(SPIRV-Headers CONFIG QUIET)
+    if (NOT SPIRV-Headers_FOUND)
+        FetchContent_Declare(SPIRV-Headers
+            URL https://github.com/KhronosGroup/SPIRV-Headers/archive/refs/tags/vulkan-sdk-1.4.321.0.tar.gz
+            URL_HASH SHA256=5bbea925663d4cd2bab23efad53874f2718248a73dcaf9dd21dff8cb48e602fc
+            DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+            EXCLUDE_FROM_ALL
+            OVERRIDE_FIND_PACKAGE
+        )
+        set(SPIRV_HEADERS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+        set(SPIRV_HEADERS_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+        FetchContent_MakeAvailable(SPIRV-Headers)
+    endif ()
     block()
         set(CMAKE_CXX_STANDARD 17)  # llama.cpp is C++17; C++20 breaks its u8"" literals
         set(BUILD_SHARED_LIBS OFF)

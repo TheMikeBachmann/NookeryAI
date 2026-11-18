@@ -1,12 +1,14 @@
 # Generated villager dialog
 
-Villagers talk in a voice you define. Two things change:
+Villagers talk in a voice you define. The goal is for every line a villager says to be written by
+the model at runtime; phase 1 covers small talk only, so by default only small talk changes
+(`rewrite_special` and `prewrite_small_talk` are off). Two things can change:
 
 - **Small talk** is written live by a language model the moment you talk to a villager, and the
   words appear in the text box as they're generated. Each line can use the current weather, time
   and mood, and topics from web sources you choose for each personality (RSS/Atom feeds,
   Wikipedia, Reddit). Lines never run out or repeat.
-- **Everything else a town villager says**, such as trade offers, sales, gifts, letters, memories
+- **Everything else a town villager says** (off by default, `rewrite_special`), such as trade offers, sales, gifts, letters, memories
   and tips, is rewritten in their personality's voice. The game's mechanics are untouched: items,
   prices, names, yes/no choices and what happens next all stay exactly as they were. Only the
   wording changes.
@@ -33,7 +35,8 @@ Small talk, live (`live_small_talk`, built-in model only):
    faster than the game types it.
 4. Sources are only fetched in the background, never while you wait.
 
-Small talk, pre-written (the fallback, and what other providers use):
+Small talk, pre-written (off by default with the built-in model, `prewrite_small_talk`; always on
+for the `local` and `anthropic` providers, which can't write live):
 
 1. The first time you talk to anyone, every villager in town is handed to the worker.
 2. For each villager the worker picks a personality, fetches that personality's sources (cached for
@@ -71,7 +74,8 @@ personality in your town. It's saved, so it only happens once.
 
 Built-in model (default, `"provider": "embedded"`):
 
-1. Get a GGUF model. The easiest way is `ollama pull llama3.1:8b`: the game finds Ollama's copy on
+1. Get a GGUF model. Drop any instruct `.gguf` into `dialog/models/` in the data folder and the game
+   loads the first one it finds (by name). Or `ollama pull llama3.1:8b`: the game finds Ollama's copy on
    disk (`~/.ollama/models`, or `OLLAMA_MODELS`) and loads it directly. Ollama doesn't need to be
    running. Or download any instruct GGUF and set `embedded.model_path` to it (relative paths are
    under `dialog/`).
@@ -118,8 +122,11 @@ own lines and only replace small talk.
   "lines_per_batch": 12,
   "min_pool": 8,                 // refill a villager urgently below this many lines
   "pool_target": 24,             // keep topping up to this many when idle
-  "rewrite_special": true,       // rewrite trades, letters, memories... in each personality's voice
+  "rewrite_special": false,      // rewrite trades, letters, memories... in each personality's voice
   "live_small_talk": true,       // write small talk as you talk (embedded provider only)
+  "prewrite_small_talk": false,  // also keep pools of pre-written lines as a fallback
+  "talk_log": true,              // record every small-talk line in dialog/talk_log.txt
+  "mark_generated": true,        // a star (the font has no '*') in front of every generated line
   "source_refresh_minutes": 60,
 
   "personalities": {
@@ -183,6 +190,27 @@ Small models sometimes add flavor that doesn't quite fit, or make a page that fa
 keeps its original text. A larger model gives better rewrites if your GPU has room.
 
 ## Debugging
+
+While testing, every generated line starts with a star (`mark_generated`) so it can be told apart
+from the game's own text at a glance. It's added when the text is laid out, not by the model.
+
+`dialog/talk_log.txt` (on by default, `talk_log`) has one readable entry per small-talk line:
+
+- `LIVE LINE`: the outcome (`ok`, `cancelled` if the player moved on, `fallback` if the model
+  failed), first-words and total time, the per-line prompt, exactly what the model wrote, what
+  the text box showed after cleanup and wrapping, and the game's original line it replaced.
+- `ORIGINAL LINE`: a small-talk message that played as the game wrote it, and why (model still
+  loading, failed to load, live off...).
+- `OTHER LINE`: a conversation that opened with something other than small talk (a trade,
+  letter, memory, tip...), left as the game wrote it, and what kind it was. Note that every
+  conversation is a first-job hint while the player works for Nook, and until they've heard 10 of
+  them, so small talk can't come up before that.
+- `PRE-WRITTEN LINE`: a pooled line was used (only with `prewrite_small_talk`).
+- `STALLED`: the text box waited 10 s with no new words and ended the line.
+- `SESSION START`, `MODEL READY` (path, GPU layers, load time), `MODEL FAILED TO LOAD`,
+  `MODEL NOT FOUND`.
+
+The file starts over past 8 MB, keeping the previous one as `talk_log.old.txt`.
 
 Set `NOOKERY_DUMP_MESSAGES=<file>` to have the game write every message at startup, readable
 (`<file>`) and raw (`<file>.bin`). The log (`--log-dir`, or the data folder's `logs/`) records each
