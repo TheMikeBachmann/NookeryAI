@@ -595,6 +595,108 @@ std::optional<Template> parse_template(const std::vector<uint8_t>& b) {
     return t;
 }
 
+namespace {
+constexpr uint8_t kNextF = 14, kForceNext = 25;
+} // namespace
+
+int next_target(const std::vector<uint8_t>& bytes) {
+    for (size_t i = 0; i < bytes.size();) {
+        const int size = code_size(&bytes[i], bytes.size() - i);
+        if (bytes[i] == kCharControl && size == 4 && bytes[i + 1] == kNextF) {
+            return (int(bytes[i + 2]) << 8) | bytes[i + 3];
+        }
+        i += static_cast<size_t>(size);
+    }
+    return -1;
+}
+
+bool retarget_next(std::vector<uint8_t>& bytes, int to) {
+    bool found = false;
+    for (size_t i = 0; i < bytes.size();) {
+        const int size = code_size(&bytes[i], bytes.size() - i);
+        if (bytes[i] == kCharControl && size == 4 && bytes[i + 1] == kNextF) {
+            bytes[i + 2] = static_cast<uint8_t>((to >> 8) & 0xFF);
+            bytes[i + 3] = static_cast<uint8_t>(to & 0xFF);
+            found = true;
+        }
+        i += static_cast<size_t>(size);
+    }
+    return found;
+}
+
+std::vector<uint8_t> jump_to(int to) {
+    return { kCharControl, kNextF, static_cast<uint8_t>((to >> 8) & 0xFF), static_cast<uint8_t>(to & 0xFF),
+             kCharControl, kForceNext, kCharControl, kContinue };
+}
+
+int spoken_words(const std::vector<uint8_t>& bytes) {
+    int words = 0;
+    bool inWord = false;
+    for (size_t i = 0; i < bytes.size();) {
+        const int size = code_size(&bytes[i], bytes.size() - i);
+        const uint8_t c = bytes[i];
+        const bool letter = size == 1 && c != kCharControl && c != kCharMessageTag &&
+                            ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '\'');
+        if (size == 1 && (c == kCharSpace || c == kCharNewLine)) {
+            inWord = false;
+        } else if (letter && !inWord) {
+            inWord = true;
+            ++words;
+        }
+        i += static_cast<size_t>(size);
+    }
+    return words;
+}
+
+int chain_words(int first) {
+    int words = 0;
+    std::set<int> seen;
+    for (int no = first; no >= 0 && seen.insert(no).second && seen.size() < 32;) {
+        const auto bytes = original(no);
+        if (!bytes) {
+            break;
+        }
+        words += spoken_words(*bytes);
+        no = next_target(*bytes);
+    }
+    return words;
+}
+
+bool is_looping(const std::string& text) {
+    std::vector<std::string> words;
+    std::string cur;
+    for (const char ch : text) {
+        if (std::isspace(static_cast<unsigned char>(ch))) {
+            if (!cur.empty()) {
+                words.push_back(std::move(cur));
+                cur.clear();
+            }
+        } else if (std::isalnum(static_cast<unsigned char>(ch)) || ch == '{' || ch == '}' || ch == '/') {
+            cur += static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        }
+    }
+    // The word still being written doesn't count yet.
+    const size_t n = words.size();
+    auto same = [&](size_t a, size_t b, size_t len) {
+        return std::equal(words.begin() + static_cast<std::ptrdiff_t>(a), words.begin() + static_cast<std::ptrdiff_t>(a + len),
+                          words.begin() + static_cast<std::ptrdiff_t>(b));
+    };
+    for (size_t len = 1; len <= 12 && len * 2 <= n; ++len) {
+        const size_t times = len < 3 ? 4 : 2;
+        if (len * times > n) {
+            continue;
+        }
+        bool loop = true;
+        for (size_t r = 1; r < times && loop; ++r) {
+            loop = same(n - len, n - len * (r + 1), len);
+        }
+        if (loop) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool looks_like_refusal(const std::string& text) {
     std::string s;
     for (char c : text) {
@@ -1109,8 +1211,23 @@ LivePageRequest live_page_request(const Page& page, const std::string& system, c
     std::string g = "root ::= (intro \" \")?";
     // Printable ASCII only (the font has no glyphs for most else), minus space, quote, asterisk,
     // backslash and braces.
-    std::string rules = "c ::= [\\x21\\x23-\\x29\\x2B-\\x5B\\x5D-\\x7A\\x7C\\x7E] | \"{player}\" | \"{catchphrase}\"\n"
-                        "w ::= c{1,12}\n"
+    // Names, dates and times are flavor too: the model may use the page's ones anywhere but
+    // doesn't have to (forcing {town} into a line that went elsewhere makes the model pad
+    // with junk until it can fit it in).
+    static const std::set<std::string> kFlavor = { "player", "catchphrase", "town", "island", "year", "month",
+                                                   "weekday", "day", "hour", "minute", "second", "am_pm" };
+    std::set<std::string> flavorUsed;
+    for_each_placeholder(page.text, [&](const std::string& key) {
+        if (kFlavor.count(key) && key != "player" && key != "catchphrase") {
+            flavorUsed.insert(key);
+        }
+    });
+    std::string rules = "c ::= [\\x21\\x23-\\x29\\x2B-\\x5B\\x5D-\\x7A\\x7C\\x7E] | \"{player}\" | \"{catchphrase}\"";
+    for (const auto& key : flavorUsed) {
+        rules += " | \"{" + key + "}\"";
+    }
+    rules += "\n"
+             "w ::= c{1,12}\n"
                         "intro ::= w (\" \" w){0,5} [,.!?]\n";
     const bool choice = asks_choice(page);
     int totalWords = 6;
@@ -1118,7 +1235,7 @@ LivePageRequest live_page_request(const Page& page, const std::string& system, c
         const auto& sen = sentences[k];
         std::vector<std::string> keys;
         for_each_placeholder(sen.text, [&](const std::string& key) {
-            if (key != "player" && key != "catchphrase") {
+            if (!kFlavor.count(key)) {
                 keys.push_back(key);
             }
         });

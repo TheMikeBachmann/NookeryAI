@@ -181,20 +181,36 @@
         { "type": "rss", "url": "https://www.theguardian.com/money/work-and-careers/rss", "limit": 8 },
         { "type": "wikipedia", "article": "Human resource management" }
       ]
+    },
+    "gooner_sexual": {
+      "voice": "Obsessed with sexual content, often making inappropriate and explicit comments. Talks about sexual experiences, fantasies, and desires in a graphic manner. Frequently uses vulgar language and sexual innuendos. Often disregards social norms and boundaries when discussing sexual topics.",
+      "topics": ["a recent sexual encounter they had", "their thoughts on a sexual fantasy", "a recent sexual experience they witnessed", "their favorite sexual position", "a recent sexual failure they experienced", "their thoughts on sexual health and wellness", "a recent sexual rumor they heard"],
+      "sources": [
+        { "type": "wikipedia", "article": "Sexuality" }
+      ]
+    },
+    // Mr. Resetti, the mole who pops up after the player quits without saving. Not a villager:
+    // nothing maps to this yet; it's for when his dialog gets wired up. He only ever talks about
+    // the reset, so topics and sources are left empty.
+    "resetti": {
+      "voice": "A furious, hard-hat-wearing mole who runs the Reset Surveillance Center and pops out of the ground to chew out the player for quitting without saving. Explosive, impatient, and self-righteous, with a working-class bluster. Takes every reset as a personal insult to him and to everyone in town. Lectures, nags and threatens extreme violence with specifics, demands apologies, and gets angrier the more times the player has done it. Swears like a construction foreman: heavy profanity in nearly every sentence (fuck, shit, goddamn, son of a bitch, dumbass), yelling and name-calling.",
+      "topics": ["the bodies he's buried below the town", "how many people he's fucking killed", "the reset process", "volatile DRAM", "his extensive gun collection"],
+      "sources": []
     }
   },
 
   // The personality for each of the game's six built-in villager types. The six names on the left
   // are the game's and can't change; the right side must match a name under "personalities"
   // (rename both together). A villager whose type points to a missing personality keeps the
-  // game's own small talk, and the talk log's SESSION START lists the problem.
+  // game's own small talk, and the talk log's SESSION START lists the problem. A list of names
+  // splits the type: each villager gets one of them, picked from their name, and keeps it.
   "by_builtin_type": {
-    "normal": "republican",
-    "peppy": "arrogant",
-    "lazy": "conspiracy_theorist",
-    "jock": "cunty",
-    "cranky": "incel",
-    "snooty": "human_resources"
+    "normal": ["republican", "gooner_sexual"],
+    "peppy": ["arrogant"],
+    "lazy": ["conspiracy_theorist"],
+    "jock": ["cunty"],
+    "cranky": ["incel"],
+    "snooty": ["human_resources"]
   },
 
   // Per-villager overrides, by in-game name. A personality name, or an object with notes the model
@@ -202,5 +218,20 @@
   "villagers": {
     // "Hector": "stargazer",
     // "Louie": { "personality": "gym_rat", "notes": "Training for the town marathon; hates losing to Hector." }
+  },
+
+  // Mr. Resetti, who pops up after the player quits without saving (needs the embedded model and
+  // live_rewrites). Everything he says is rewritten in the personality's voice, keeping what
+  // happens (the music, his animations, the typing test). Don Resetti keeps his own lines.
+  "resetti": {
+    "enabled": true,
+    "personality": "resetti",   // a name under "personalities"
+    // An off-script rant about one of the personality's topics, spliced in before the last part
+    // of his lecture, then back to the lecture. Once per visit.
+    "rant": true,
+    "rant_words": 0,            // how long the rant runs; 0 = as long as that visit's own lecture
+    // When he makes the player type an apology, the phrase is generated (filthy) instead of the
+    // game's own. Typing it right counts whatever the case, spaces or punctuation.
+    "generated_phrase": true
   }
 }

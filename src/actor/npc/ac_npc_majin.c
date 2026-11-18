@@ -1,6 +1,9 @@
 #include "ac_npc_majin.h"
 
 #include "m_common_data.h"
+#ifdef TARGET_PC
+#include "pc_dialog.h"
+#endif
 #include "m_player_lib.h"
 #include "m_font.h"
 #include "m_msg.h"
@@ -76,6 +79,9 @@ static void aMJN_actor_save(ACTOR* actorx, GAME* game) {
 }
 
 static void aMJN_actor_dt(ACTOR* actorx, GAME* game) {
+#ifdef TARGET_PC
+    pc_dialog_end_resetti(actorx);
+#endif
     NPC_CLIP->dt_proc(actorx, game);
     eEC_CLIP->effect_kill_proc(eEC_EFFECT_RESET_HOLE, RSV_NO);
     if (CLIP(demo_clip2) != NULL && CLIP(demo_clip2)->type == mDemo_CLIP_TYPE_RESET_DEMO) {

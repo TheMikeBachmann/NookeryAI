@@ -97,6 +97,30 @@ void pc_dialog_start(void);
 void pc_dialog_end_talk(void);
 
 /*
+ * Mr. Resetti (`actor`) starts talking. Everything he says until he leaves is rewritten
+ * in the "resetti" personality's voice (personalities.json, "resetti" section), and an
+ * off-script rant is spliced in before the last message of his lecture. Calling it again
+ * for the same actor (his next talk on the same visit) keeps the visit going: one rant
+ * per visit.
+ */
+void pc_dialog_begin_resetti(const void* actor, const uint8_t* player_name, int player_name_len);
+
+/* Mr. Resetti leaves (his actor is going away). */
+void pc_dialog_end_resetti(const void* actor);
+
+/*
+ * A generated phrase for the player to type as their apology, in game characters, padded
+ * with spaces to `dst_size`. Returns 1 if one was ready, 0 if the game's own should be used.
+ */
+int pc_dialog_resetti_phrase(uint8_t* dst, int dst_size);
+
+/*
+ * Whether what the player typed (`typed`, `len` game characters, space padded) is the
+ * phrase: letters and digits compared ignoring case, spaces and punctuation.
+ */
+int pc_dialog_phrase_matches(const uint8_t* typed, const uint8_t* phrase, int len);
+
+/*
  * Message numbers a villager with built-in personality `looks` can open a
  * conversation with, all of one kind; `situation` says in plain English what is
  * going on (a trade, a letter, a memory...). The service follows each one's

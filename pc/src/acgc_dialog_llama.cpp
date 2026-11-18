@@ -161,6 +161,8 @@ std::optional<std::string> generate(const std::string& system, const std::string
         return std::nullopt;
     }
     llama_sampler_chain_add(chain, grammarSampler);
+    // Discourages the loops a constrained small model falls into when it runs out of things to say.
+    llama_sampler_chain_add(chain, llama_sampler_init_penalties(llama_vocab_n_tokens(vocab), 64, 1.1f, 0.0f, 0.0f));
     llama_sampler_chain_add(chain, llama_sampler_init_min_p(0.05f, 1));
     llama_sampler_chain_add(chain, llama_sampler_init_temp(temperature));
     llama_sampler_chain_add(chain, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));

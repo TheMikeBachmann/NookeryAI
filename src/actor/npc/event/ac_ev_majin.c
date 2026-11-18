@@ -1,6 +1,9 @@
 #include "ac_ev_majin.h"
 
 #include "m_common_data.h"
+#ifdef TARGET_PC
+#include "pc_dialog.h"
+#endif
 #include "m_name_table.h"
 #include "m_demo.h"
 #include "ac_groundhog_control.h"
@@ -70,6 +73,9 @@ static void aEMJ_actor_save(ACTOR* actor, GAME* game) {
 }
 
 static void aEMJ_actor_dt(ACTOR* actor, GAME* game) {
+#ifdef TARGET_PC
+    pc_dialog_end_resetti(actor);
+#endif
     if (CLIP(groundhog_control_clip) != NULL) {
         CLIP(groundhog_control_clip)->groundhog_npc_actor = NULL;
     }

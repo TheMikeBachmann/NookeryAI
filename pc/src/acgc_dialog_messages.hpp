@@ -83,6 +83,21 @@ std::vector<std::vector<uint8_t>> wrap_text(const std::string& text, ResolveFn r
 // "As an AI..."), not something a villager would say.
 bool looks_like_refusal(const std::string& text);
 
+// The message a <NEXT_F n> code in `bytes` jumps to, or -1 if there's none.
+int next_target(const std::vector<uint8_t>& bytes);
+// Points every <NEXT_F n> in `bytes` at `to`. False if there was none.
+bool retarget_next(std::vector<uint8_t>& bytes, int to);
+// The bytes of <NEXT_F to><FORCE_NEXT><CONTINUE>: jump straight on to message `to`.
+std::vector<uint8_t> jump_to(int to);
+// About how many words are spoken in `bytes` (text only, codes skipped).
+int spoken_words(const std::vector<uint8_t>& bytes);
+// spoken_words over message `first` and everything it jumps on to with <NEXT_F n>.
+int chain_words(int first);
+
+// True when the end of `text` is the model stuck in a loop: the same phrase of 3+ words twice
+// in a row, or the same word or pair four times.
+bool is_looping(const std::string& text);
+
 // Replaces typographic punctuation the game font has no glyph for.
 std::string normalize_punctuation(const std::string& s);
 

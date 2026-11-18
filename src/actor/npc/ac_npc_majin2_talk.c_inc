@@ -30,6 +30,9 @@ static void aMJN2_set_force_talk_info(ACTOR* actorx) {
     NPC_MAJIN2_ACTOR* actor = (NPC_MAJIN2_ACTOR*)actorx;
     aMJN2_talk_data_c* data_p = &dt_tbl[actor->force_talk_idx];
 
+#ifdef TARGET_PC
+    pc_dialog_begin_resetti(actorx, Now_Private->player_ID.player_name, PLAYER_NAME_LEN);
+#endif
     mDemo_Set_msg_num(data_p->msg_no);
     mDemo_Set_talk_turn(TRUE);
     actor->talk_proc = data_p->talk_proc;
@@ -52,6 +55,9 @@ static void aMJN2_set_norm_talk_info(ACTOR* actorx) {
     NPC_MAJIN2_ACTOR* actor = (NPC_MAJIN2_ACTOR*)actorx;
     aMJN2_talk_data_c* data_p = &dt_tbl[actor->norm_talk_idx];
 
+#ifdef TARGET_PC
+    pc_dialog_begin_resetti(actorx, Now_Private->player_ID.player_name, PLAYER_NAME_LEN);
+#endif
     mDemo_Set_msg_num(data_p->msg_no);
     mDemo_Set_talk_turn(TRUE);
     actor->talk_proc = data_p->talk_proc;

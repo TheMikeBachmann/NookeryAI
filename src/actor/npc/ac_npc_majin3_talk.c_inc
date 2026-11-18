@@ -1,6 +1,19 @@
+#ifdef TARGET_PC
+/* The generated phrase he asked for this visit (pc_dialog_resetti_phrase), if any. */
+static u8 l_aMJN3_pc_phrase[mString_DEFAULT_STR_SIZE];
+static int l_aMJN3_pc_phrase_on = FALSE;
+#endif
+
 static int aMJN3_check_good_word(NPC_MAJIN3_ACTOR* actor) {
     u8 word[mString_DEFAULT_STR_SIZE];
     int ret = FALSE;
+
+#ifdef TARGET_PC
+    if (l_aMJN3_pc_phrase_on) {
+        /* Letters and digits must match; case, spaces and punctuation don't count. */
+        return pc_dialog_phrase_matches(actor->reply, l_aMJN3_pc_phrase, mString_DEFAULT_STR_SIZE);
+    }
+#endif
 
     mString_Load_StringFromRom(word, sizeof(word), mString_RESETTI_GOOD_WORD_START + actor->reply_idx);
     if (mem_cmp(actor->reply, word, sizeof(word)) == TRUE) {
@@ -129,6 +142,9 @@ static void aMJN3_set_force_talk_info(ACTOR* actorx) {
     NPC_MAJIN3_ACTOR* actor = (NPC_MAJIN3_ACTOR*)actorx;
     aMJN3_talk_data_c* data_p = &dt_tbl[actor->talk_idx];
 
+#ifdef TARGET_PC
+    pc_dialog_begin_resetti(actorx, Now_Private->player_ID.player_name, PLAYER_NAME_LEN);
+#endif
     mDemo_Set_msg_num(data_p->msg_no);
     mDemo_Set_talk_turn(TRUE);
     actor->talk_proc = data_p->talk_proc;
@@ -151,6 +167,12 @@ static int aMJN3_talk_init(ACTOR* actorx, GAME* game) {
         actor->npc_class.talk_info.default_animation = aNPC_ANIM_WAIT_R1;
         actor->reply_idx = RANDOM((mString_RESETTI_GOOD_WORD_END - mString_RESETTI_GOOD_WORD_START) + 1);
         mString_Load_StringFromRom(str, sizeof(str), mString_RESETTI_GOOD_WORD_START + actor->reply_idx);
+#ifdef TARGET_PC
+        l_aMJN3_pc_phrase_on = pc_dialog_resetti_phrase(l_aMJN3_pc_phrase, sizeof(l_aMJN3_pc_phrase));
+        if (l_aMJN3_pc_phrase_on) {
+            mem_copy(str, l_aMJN3_pc_phrase, sizeof(str));
+        }
+#endif
         mMsg_SET_ITEM_STR(mMsg_FREE_STR0, str, sizeof(str));
         actor->npc_class.talk_info.talk_request_proc = (aNPC_TALK_REQUEST_PROC)none_proc1;
         mDemo_Set_ListenAble();

@@ -129,6 +129,9 @@ static void aEMJ_set_force_talk_info(ACTOR* actor) {
             break;
     }
 
+#ifdef TARGET_PC
+    pc_dialog_begin_resetti(actor, Now_Private->player_ID.player_name, PLAYER_NAME_LEN);
+#endif
     mDemo_Set_msg_num(msg_num);
 }
 

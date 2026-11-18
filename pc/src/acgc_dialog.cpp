@@ -84,6 +84,9 @@ namespace http = borealis::http;
 constexpr uint8_t kCharControl = 0x7F;
 constexpr uint8_t kCharSpace = 0x20;
 constexpr uint8_t kContLast = 0x00;       // end of message
+constexpr uint8_t kContButton = 0x04;     // wait for the player to press A
+constexpr uint8_t kContDemoNpc0 = 0x09;   // <DEMO_ORDER_NPC0 index value>: the speaker's animation
+constexpr uint8_t kContSoundTrgSys = 0x59; // <SOUND_TRG_SYS n>
 constexpr uint8_t kContPlayerName = 0x1A; // mFont_CONT_CODE_PUT_STRING_PLAYER_NAME
 constexpr uint8_t kContTail = 0x1C;       // mFont_CONT_CODE_PUT_STRING_TAIL (catchphrase)
 // Shown in front of every generated line (mark_generated) so it can be told apart from the game's
@@ -171,8 +174,16 @@ struct Config {
     std::array<int, 4> topicMix = { 25, 35, 25, 15 }; // weights by TopicKind
     std::vector<std::string> villageTopics;           // {neighbor} = another villager
     std::map<std::string, Personality> personalities;
-    std::array<std::string, 6> byLooks;
+    std::array<std::vector<std::string>, 6> byLooks; // one name, or several to split the type between
     std::map<std::string, VillagerOverride> villagers;
+    // "resetti": Mr. Resetti, who pops up after the player quits without saving.
+    struct {
+        bool enabled = true;           // rewrite what he says in his personality's voice
+        std::string personality = "resetti";
+        bool rant = true;              // splice an off-script rant in before his lecture's last message
+        int rantWords = 0;             // how long the rant runs; 0 = as long as that visit's own lecture
+        bool generatedPhrase = true;   // a generated phrase for the player to type, when he asks for one
+    } resetti;
 };
 
 // Fallback when res/dialog/personalities.jsonc (the real defaults, with comments) is missing.
@@ -329,6 +340,13 @@ Config parse_config(const json& j) {
     c.prewriteSmallTalk = j.value("prewrite_small_talk", c.prewriteSmallTalk);
     c.talkLog = j.value("talk_log", c.talkLog);
     c.markGenerated = j.value("mark_generated", c.markGenerated);
+    if (auto it = j.find("resetti"); it != j.end() && it->is_object()) {
+        c.resetti.enabled = it->value("enabled", c.resetti.enabled);
+        c.resetti.personality = it->value("personality", c.resetti.personality);
+        c.resetti.rant = it->value("rant", c.resetti.rant);
+        c.resetti.rantWords = std::clamp(it->value("rant_words", c.resetti.rantWords), 0, 2000);
+        c.resetti.generatedPhrase = it->value("generated_phrase", c.resetti.generatedPhrase);
+    }
     // The message buffer is 1536 bytes; 1000 characters plus page codes still fits.
     c.maxLineChars = std::clamp(j.value("max_line_chars", c.maxLineChars), 100, 1000);
     if (auto it = j.find("tone"); it != j.end() && it->is_object()) {
@@ -384,7 +402,19 @@ Config parse_config(const json& j) {
     }
     if (auto it = j.find("by_builtin_type"); it != j.end() && it->is_object()) {
         for (size_t i = 0; i < kLooksNames.size(); ++i) {
-            c.byLooks[i] = it->value(kLooksNames[i], "");
+            const auto e = it->find(kLooksNames[i]);
+            if (e == it->end()) {
+                continue;
+            }
+            if (e->is_string() && !e->get<std::string>().empty()) {
+                c.byLooks[i].push_back(e->get<std::string>());
+            } else if (e->is_array()) {
+                for (const auto& name : *e) {
+                    if (name.is_string() && !name.get<std::string>().empty()) {
+                        c.byLooks[i].push_back(name.get<std::string>());
+                    }
+                }
+            }
         }
     }
     if (auto it = j.find("villagers"); it != j.end() && it->is_object()) {
@@ -857,6 +887,8 @@ struct VillagerInfo {
     int looks = 0;
     int mood = 0;
     Clock::time_point retryAfter{};
+    bool special = false;         // not a town villager (Mr. Resetti): no small talk, not a neighbor
+    std::string fixedPersonality; // special characters' personality, from their own config section
 };
 
 struct Material {
@@ -885,6 +917,17 @@ struct Talk {
     Names names;
     std::string situation;            // what's going on, from the conversation's opener
     std::vector<std::string> history; // what the villager has said so far (as shown), for context
+    // Mr. Resetti: one visit can be several talks with the same actor; the rant happens once.
+    bool special = false;
+    int firstMsg = -1; // the first message of the talk that gets the rant (its lecture's length sets the rant's)
+    struct Rant {
+        bool planned = false;  // spliced in: the lecture now jumps to the rant
+        int returnTo = -1;     // the lecture's message the rant hands back to
+        int segments = 0;      // messages the rant is split over (a message holds ~1500 bytes)
+        int targetWords = 0;
+        std::string topic;
+        std::vector<std::string> parts; // each segment as shown
+    } rant;
 };
 
 // A message being rewritten live: its template and the print widths of its inline strings,
@@ -983,7 +1026,7 @@ private:
 };
 
 struct Job {
-    enum class Kind { None, Live, Chat, Rewrite } kind = Kind::None;
+    enum class Kind { None, Live, Chat, Rewrite, Phrase } kind = Kind::None;
     std::string villager;    // Chat
     std::string personality; // Rewrite
     int msgNo = -1;          // Rewrite
@@ -1155,7 +1198,162 @@ public:
 
     void end_talk() {
         std::lock_guard lock(m_mutex);
-        m_talk.active = false;
+        if (!m_talk.special) { // Mr. Resetti's visit lasts until he leaves (end_resetti)
+            m_talk.active = false;
+        }
+    }
+
+    // ---- Mr. Resetti ----
+
+    static constexpr const char* kResettiName = "Mr. Resetti";
+    // The rant's messages. They must be below MSG_MAX (0x3F91) or the game won't load them; the
+    // archive's own messages there are only ever replaced while a rant is running.
+    static constexpr int kRantBase = 0x3F80;
+    static constexpr int kRantMax = 16;
+
+    bool resetti_ready_locked() const {
+        return m_config.enabled && m_config.resetti.enabled && m_config.provider == Provider::Embedded &&
+               m_config.liveRewrites && m_config.personalities.count(m_config.resetti.personality);
+    }
+
+    void begin_resetti(const void* actor, const uint8_t* player, int playerLen) {
+        ensure_started();
+        if (actor == nullptr) {
+            return;
+        }
+        std::lock_guard lock(m_mutex);
+        if (m_talk.special && m_talk.actor == actor) {
+            m_talk.active = true; // his next talk on the same visit
+            return;
+        }
+        auto& info = m_villagers[kResettiName];
+        info.name = kResettiName;
+        info.special = true;
+        info.fixedPersonality = m_config.resetti.personality;
+        info.looks = 4; // cranky, for anything that needs a built-in type
+        Talk talk;
+        talk.active = resetti_ready_locked();
+        talk.actor = actor;
+        talk.villager = kResettiName;
+        talk.special = true;
+        talk.personality = info.fixedPersonality;
+        talk.names.player.assign(player, player + std::clamp(playerLen, 0, 16));
+        while (!talk.names.player.empty() && talk.names.player.back() == kCharSpace) {
+            talk.names.player.pop_back();
+        }
+        talk.situation = "Mr. Resetti has burst out of the ground to chew out the player for quitting the game "
+                         "without saving (resetting).";
+        m_talk = std::move(talk);
+        m_hot.clear();
+        if (m_talkLog.enabled()) {
+            std::string why;
+            if (!m_config.resetti.enabled) {
+                why = "resetti.enabled is off";
+            } else if (!m_config.personalities.count(m_config.resetti.personality)) {
+                why = "personality \"" + m_config.resetti.personality + "\" isn't in personalities";
+            } else if (!m_config.liveRewrites || m_config.provider != Provider::Embedded) {
+                why = "live rewrites need the embedded model";
+            }
+            m_talkLog.write("RESETTI VISIT", {
+                { "Personality", m_config.resetti.personality },
+                { "Rewritten", why.empty() ? "yes" : "no (" + why + "); he says the game's own lines" },
+                { "Rant", m_config.resetti.rant ? (m_config.resetti.rantWords > 0
+                                                       ? std::to_string(m_config.resetti.rantWords) + " words"
+                                                       : std::string("as long as his own lecture"))
+                                                 : std::string("off") },
+            });
+        }
+    }
+
+    void end_resetti(const void* actor) {
+        std::lock_guard lock(m_mutex);
+        if (m_talk.special && m_talk.actor == actor) {
+            m_talk = Talk{};
+            if (m_stream.active) {
+                m_stream.active = false;
+                m_stream.cancelled = true;
+            }
+        }
+    }
+
+    // Main thread, from rewrite_live: true if message `msgNo` (`bytes`) jumps on to the lecture's
+    // last message, so the rant goes in after it (the caller points its <NEXT_F> at kRantBase).
+    bool plan_rant_locked(int msgNo, const std::vector<uint8_t>& bytes) {
+        if (!m_talk.special || !m_config.resetti.rant || m_talk.rant.planned) {
+            return false;
+        }
+        if (m_talk.firstMsg < 0) {
+            m_talk.firstMsg = msgNo;
+        }
+        const int next = msg::next_target(bytes);
+        if (next < 0 || next >= kRantBase) {
+            return false;
+        }
+        const auto after = msg::original(next);
+        if (!after || msg::next_target(*after) >= 0) {
+            return false; // not the last message yet
+        }
+        auto& r = m_talk.rant;
+        r.planned = true;
+        r.returnTo = next;
+        r.targetWords = m_config.resetti.rantWords > 0 ? m_config.resetti.rantWords
+                                                       : std::max(150, msg::chain_words(m_talk.firstMsg));
+        constexpr int kWordsPerSegment = 140; // ~850-1000 characters: comfortably inside one message
+        r.segments = std::clamp((r.targetWords + kWordsPerSegment - 1) / kWordsPerSegment, 1, kRantMax);
+        const auto pit = m_config.personalities.find(m_talk.personality);
+        const auto& topics = pit != m_config.personalities.end() ? pit->second.topics : std::vector<std::string>{};
+        if (topics.empty()) {
+            r.topic = "whatever's eating at him today";
+        } else {
+            auto& history = m_rantTopics;
+            std::vector<std::string> fresh;
+            for (const auto& t : topics) {
+                if (std::find(history.begin(), history.end(), t) == history.end()) {
+                    fresh.push_back(t);
+                }
+            }
+            const auto& from = fresh.empty() ? topics : fresh;
+            r.topic = from[std::uniform_int_distribution<size_t>(0, from.size() - 1)(m_rng)];
+            history.push_back(r.topic);
+            while (history.size() > std::max<size_t>(1, topics.size() - 1)) {
+                history.pop_front();
+            }
+        }
+        if (m_talkLog.enabled()) {
+            m_talkLog.write("RESETTI RANT PLANNED", {
+                { "After message", std::to_string(msgNo) },
+                { "Then back to", std::to_string(next) },
+                { "Topic", r.topic },
+                { "Length", std::to_string(r.targetWords) + " words over " + std::to_string(r.segments) +
+                                " messages (his lecture this visit: " + std::to_string(msg::chain_words(m_talk.firstMsg)) +
+                                " words)" },
+            });
+        }
+        return true;
+    }
+
+    // Main thread: one of the rant's messages is loading. Starts writing it live.
+    int rewrite_rant(int segment) {
+        auto& r = m_talk.rant;
+        if (!r.planned || segment >= r.segments) {
+            return -1;
+        }
+        m_stream = Stream{};
+        m_stream.id = ++m_streamCounter;
+        m_stream.lastProgress = Clock::now();
+        m_stream.active = true;
+        m_stream.shownAt = Clock::now();
+        auto rescue = std::vector<uint8_t>{ kCharControl, kContButton };
+        const auto jump = msg::jump_to(r.returnTo);
+        rescue.insert(rescue.end(), jump.begin(), jump.end());
+        m_stream.rescue = std::move(rescue);
+        LiveRequest req{ m_stream.id, m_talk.villager, m_talk.names, kRantBase + segment, {} };
+        req.rantSegment = segment;
+        m_live = std::move(req);
+        m_preempt = true;
+        m_armed.reset();
+        m_cv.notify_all();
+        return 0;
     }
 
     void register_roots(int looks, const char* situation, const int* msgs, int count) {
@@ -1184,7 +1382,7 @@ public:
             return -1;
         }
         if (m_config.liveRewrites && m_config.provider == Provider::Embedded) {
-            return rewrite_live(msgNo, actor, dstSize);
+            return rewrite_live(msgNo, actor, dst, dstSize);
         }
         if (!m_config.rewriteSpecial) {
             return -1;
@@ -1231,7 +1429,25 @@ public:
     }
 
     // Sets up a live rewrite of `msgNo` for the villager being talked to. Main thread.
-    int rewrite_live(int msgNo, const void* actor, int dstSize) {
+    int rewrite_live(int msgNo, const void* actor, uint8_t* dst, int dstSize) {
+        if (msgNo >= kRantBase && msgNo < kRantBase + kRantMax) {
+            std::lock_guard lock(m_mutex);
+            if (!m_talk.special || !m_talk.rant.planned) {
+                return -1; // the archive's own message (never reached while no rant runs)
+            }
+            if (m_liveReady && m_talk.actor == actor) {
+                if (const int n = rewrite_rant(msgNo - kRantBase); n >= 0) {
+                    return n;
+                }
+            }
+            // Can't write it: straight back to the lecture.
+            const auto jump = msg::jump_to(m_talk.rant.returnTo);
+            if (static_cast<int>(jump.size()) > dstSize) {
+                return -1;
+            }
+            std::memcpy(dst, jump.data(), jump.size());
+            return static_cast<int>(jump.size());
+        }
         if (!m_liveReady) {
             return -1; // model still loading
         }
@@ -1245,6 +1461,15 @@ public:
             m_talk.situation = it->second; // an opener; its branches keep this situation
         }
         if (!tpl || tpl->rewritable_pages() == 0) {
+            if (m_talk.special && original) {
+                // Nothing to reword, but the rant may still need splicing in after it.
+                auto bytes = *original;
+                if (plan_rant_locked(msgNo, bytes) && msg::retarget_next(bytes, kRantBase) &&
+                    static_cast<int>(bytes.size()) <= dstSize) {
+                    std::memcpy(dst, bytes.data(), bytes.size());
+                    return static_cast<int>(bytes.size());
+                }
+            }
             if (m_talkLog.enabled() && original) {
                 m_talkLog.write("ORIGINAL LINE  " + m_talk.villager, {
                     { "Message", std::to_string(msgNo) },
@@ -1255,6 +1480,18 @@ public:
             return -1;
         }
 
+        if (m_talk.special && plan_rant_locked(msgNo, *original)) {
+            // The <NEXT_F> is in the tail or the last page's trailing codes; point it at the rant.
+            msg::retarget_next(tpl->tail, kRantBase);
+            for (auto& page : tpl->pages) {
+                msg::retarget_next(page.lead, kRantBase);
+                msg::retarget_next(page.trail, kRantBase);
+                msg::retarget_next(page.original, kRantBase);
+            }
+            for (auto& sep : tpl->separators) {
+                msg::retarget_next(sep, kRantBase);
+            }
+        }
         auto plan = std::make_shared<RewritePlan>();
         plan->msgNo = msgNo;
         plan->bufSize = static_cast<size_t>(dstSize);
@@ -1388,6 +1625,7 @@ private:
         Names names;
         int msgNo = -1; // the game's message this replaces
         std::shared_ptr<RewritePlan> plan; // set: a live rewrite of msgNo; unset: small talk
+        int rantSegment = -1;              // >= 0: that part of Mr. Resetti's rant
     };
 
     // The "tone" rules as prompt lines ("- rule\n" each).
@@ -1403,13 +1641,15 @@ private:
     std::vector<std::string> config_problems() const {
         std::vector<std::string> out;
         for (size_t i = 0; i < kLooksNames.size(); ++i) {
-            const auto& pid = m_config.byLooks[i];
-            if (pid.empty()) {
+            if (m_config.byLooks[i].empty()) {
                 out.push_back(std::string("by_builtin_type has no personality for \"") + kLooksNames[i] +
                               "\"; those villagers keep the game's own small talk");
-            } else if (!m_config.personalities.count(pid)) {
-                out.push_back(std::string("by_builtin_type \"") + kLooksNames[i] + "\" points to \"" + pid +
-                              "\", which isn't in personalities; those villagers keep the game's own small talk");
+            }
+            for (const auto& pid : m_config.byLooks[i]) {
+                if (!m_config.personalities.count(pid)) {
+                    out.push_back(std::string("by_builtin_type \"") + kLooksNames[i] + "\" points to \"" + pid +
+                                  "\", which isn't in personalities; villagers given it keep the game's own small talk");
+                }
             }
         }
         for (const auto& [name, v] : m_config.villagers) {
@@ -2204,13 +2444,30 @@ ws     ::= [ \t\n]{0,4}
     }
 
     std::pair<std::string, std::string> resolve_personality(const VillagerInfo& v) const {
+        if (v.special) {
+            return { v.fixedPersonality, "" };
+        }
         if (auto it = m_config.villagers.find(v.name); it != m_config.villagers.end()) {
             if (m_config.personalities.count(it->second.personality)) {
                 return { it->second.personality, it->second.notes };
             }
-            return { m_config.byLooks[std::clamp(v.looks, 0, 5)], it->second.notes };
+            return { by_type(v), it->second.notes };
         }
-        return { m_config.byLooks[std::clamp(v.looks, 0, 5)], "" };
+        return { by_type(v), "" };
+    }
+
+    // The villager's type's personality. With several listed, each villager keeps the same one
+    // (picked from their name), so the type is split between them.
+    std::string by_type(const VillagerInfo& v) const {
+        const auto& list = m_config.byLooks[std::clamp(v.looks, 0, 5)];
+        if (list.empty()) {
+            return {};
+        }
+        uint32_t h = 2166136261u; // FNV-1a: stable across runs and platforms, unlike std::hash
+        for (const unsigned char ch : v.name) {
+            h = (h ^ ch) * 16777619u;
+        }
+        return list[h % list.size()];
     }
 
     // ---- Rewrites of the game's own messages ----
@@ -2227,7 +2484,7 @@ ws     ::= [ \t\n]{0,4}
         std::map<std::string, std::set<int>> queued;
         for (const auto& [name, info] : m_villagers) {
             const std::string pid = resolve_personality(info).first;
-            if (pid.empty() || !m_config.personalities.count(pid)) {
+            if (info.special || pid.empty() || !m_config.personalities.count(pid)) {
                 continue;
             }
             auto& order = m_backlog[pid];
@@ -2382,7 +2639,7 @@ ws     ::= [ \t\n]{0,4}
         {
             std::lock_guard lock(m_mutex);
             for (const auto& [name, info] : m_villagers) {
-                if (name != villager) {
+                if (name != villager && !info.special) {
                     neighbors.push_back(name);
                 }
             }
@@ -2647,6 +2904,376 @@ ws     ::= [ \t\n]{0,4}
 
     }
 
+    // ---- Mr. Resetti's phrase for the player to type ----
+
+    // Writes a batch of phrases ahead of time, so one is there the moment he asks. The model
+    // can't count characters, so it writes several and the ones that fit the typing box are
+    // kept. Worker thread.
+    void do_phrase() {
+        const std::string system =
+            "You write for Mr. Resetti, a foul-mouthed mole in " + m_config.toneSetting + ". When the player keeps "
+            "resetting the game, he makes them type a humiliating apology, word for word, before he'll leave. It's "
+            "what the PLAYER says about themselves, in the first person, like the game's own: I stink / I was bad / "
+            "I repent / Moles rule.\n"
+            "Write 8 new phrases for the player to type, one per line. Make them filthy: crude, dirty, sexual or "
+            "gross, degrading confessions that are mortifying to type, like: I sniff butts / I lick toilets / "
+            "I'm a skank / Moles own my ass.\n"
+            "Rules:\n"
+            + tone_rules_text() +
+            "- Nothing involving minors.\n"
+            "- Each phrase 2 to 4 short words, 16 characters at most counting spaces.\n"
+            "- Letters, spaces and apostrophes only.\n"
+            "- Just the phrases, one per line, nothing else.";
+        {
+            std::lock_guard lock(m_mutex);
+            for (auto& p : m_usedPhrases) {
+                m_recentPhrases.push_back(std::move(p));
+            }
+            m_usedPhrases.clear();
+            while (m_recentPhrases.size() > 16) {
+                m_recentPhrases.pop_front();
+            }
+        }
+        std::ostringstream user;
+        if (!m_recentPhrases.empty()) {
+            user << "Phrases he made them type lately (don't reuse): ";
+            for (size_t i = 0; i < m_recentPhrases.size(); ++i) {
+                user << (i ? ", " : "") << m_recentPhrases[i];
+            }
+            user << "\n\n";
+        }
+        user << "Write the 8 phrases now.";
+        const std::string grammar = "root ::= (p \"\\n\"){8}\np ::= [A-Za-z'] [A-Za-z' ]{2,22}\n";
+        std::vector<std::string> kept, dropped;
+        for (int attempt = 0; attempt < 3 && kept.empty(); ++attempt) {
+            const auto out = complete("phrases for Mr. Resetti", system, user.str(), grammar, json::object(), 120, 1.0f, {}, {});
+            if (!out) {
+                break;
+            }
+            std::istringstream lines(*out);
+            for (std::string line; std::getline(lines, line);) {
+                const std::string phrase = collapse_spaces(line);
+                const std::string low = lower_ascii(phrase);
+                const bool chatter = low.rfind("here ", 0) == 0 || low.find("phrase") != std::string::npos ||
+                                     low.find("resetti") != std::string::npos || low.find("mr ") != std::string::npos;
+                if (phrase.empty()) {
+                    continue;
+                }
+                if (phrase.size() > static_cast<size_t>(kPhraseChars) || phrase.find(' ') == std::string::npos ||
+                    chatter || msg::looks_like_refusal(phrase) ||
+                    std::find(m_recentPhrases.begin(), m_recentPhrases.end(), phrase) != m_recentPhrases.end() ||
+                    std::find(kept.begin(), kept.end(), phrase) != kept.end()) {
+                    dropped.push_back(phrase);
+                    continue;
+                }
+                kept.push_back(phrase);
+            }
+        }
+        {
+            std::lock_guard lock(m_mutex);
+            for (auto& p : kept) {
+                m_phrases.push_back(p);
+            }
+        }
+        if (m_talkLog.enabled()) {
+            auto join = [](const std::vector<std::string>& v) {
+                std::string out;
+                for (const auto& x : v) {
+                    out += (out.empty() ? "" : " / ") + x;
+                }
+                return out.empty() ? std::string("(none)") : out;
+            };
+            m_talkLog.write(kept.empty() ? "RESETTI PHRASES FAILED" : "RESETTI PHRASES WRITTEN", {
+                { "Kept", join(kept) },
+                { "Dropped (too long, one word, chatter, refusal or a repeat)", join(dropped) },
+            });
+        }
+    }
+
+    static std::string lower_ascii(std::string s) {
+        for (auto& c : s) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        return s;
+    }
+
+    static constexpr int kPhraseChars = 16; // the typing box (mLE_TYPE_RESET) holds 16
+
+    static std::string collapse_spaces(const std::string& s) {
+        std::string out;
+        for (const char c : s) {
+            if (c == ' ' && (out.empty() || out.back() == ' ')) {
+                continue;
+            }
+            out += c;
+        }
+        while (!out.empty() && out.back() == ' ') {
+            out.pop_back();
+        }
+        return out;
+    }
+
+public:
+    // Main thread, when he asks for a phrase (ac_npc_majin3).
+    int take_phrase(uint8_t* dst, int dstSize) {
+        std::lock_guard lock(m_mutex);
+        if (!m_config.resetti.generatedPhrase || !resetti_ready_locked() || m_phrases.empty()) {
+            m_phraseWanted = true; // try writing some (again) for next time
+            m_cv.notify_all();
+            if (m_talkLog.enabled()) {
+                m_talkLog.write("RESETTI PHRASE", {
+                    { "Phrase", "(the game's own)" },
+                    { "Why", !m_config.resetti.generatedPhrase ? "resetti.generated_phrase is off"
+                             : !resetti_ready_locked()        ? "Resetti isn't rewritten (see RESETTI VISIT)"
+                                                              : "none was ready yet" },
+                });
+            }
+            return 0;
+        }
+        std::memset(dst, kCharSpace, static_cast<size_t>(dstSize));
+        const size_t pick = std::uniform_int_distribution<size_t>(0, m_phrases.size() - 1)(m_rng);
+        const std::string phrase = m_phrases[pick];
+        m_phrases.erase(m_phrases.begin() + static_cast<std::ptrdiff_t>(pick));
+        for (size_t i = 0; i < phrase.size() && i < static_cast<size_t>(dstSize); ++i) {
+            dst[i] = static_cast<uint8_t>(phrase[i]); // letters and spaces: the same in the game's characters
+        }
+        m_activePhrase = phrase;
+        m_usedPhrases.push_back(phrase);
+        if (m_phrases.empty()) {
+            m_phraseWanted = true; // write some more
+            m_cv.notify_all();
+        }
+        if (m_talkLog.enabled()) {
+            m_talkLog.write("RESETTI PHRASE", { { "Phrase", phrase } });
+        }
+        return 1;
+    }
+
+    // Letters and digits only, lowercased: what has to match when the player types the phrase.
+    static std::string phrase_key(const uint8_t* s, int len) {
+        std::string out;
+        for (int i = 0; i < len; ++i) {
+            const uint8_t c = s[i];
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+                out += static_cast<char>(std::tolower(c));
+            }
+        }
+        return out;
+    }
+
+    // Main thread, when the player has typed it (ac_npc_majin3).
+    bool phrase_matches(const uint8_t* typed, const uint8_t* phrase, int len) {
+        const std::string want = phrase_key(phrase, len);
+        const bool ok = !want.empty() && phrase_key(typed, len) == want;
+        if (m_talkLog.enabled()) {
+            m_talkLog.write("RESETTI PHRASE TYPED", {
+                { "Asked for", game_to_utf8(phrase, len) },
+                { "Typed", game_to_utf8(typed, len) },
+                { "Result", ok ? "match (case, spaces and punctuation don't count)" : "no match" },
+            });
+        }
+        return ok;
+    }
+
+private:
+    // ---- Mr. Resetti's rant ----
+
+    // Writes one message of the rant live. It ends by jumping to the rant's next message, or (the
+    // last one) back to his lecture. Worker thread.
+    void do_rant(const LiveRequest& req) {
+        m_preempt = false;
+        const auto started = Clock::now();
+        const int k = req.rantSegment;
+        Talk::Rant rant;
+        std::vector<std::string> history;
+        size_t bufSize = 0;
+        {
+            std::lock_guard lock(m_mutex);
+            if (!m_talk.special) {
+                return;
+            }
+            rant = m_talk.rant;
+            history = m_talk.history;
+        }
+        bufSize = 1536; // mMsg_MSG_BUF_MAX
+        const bool last = k + 1 >= rant.segments;
+        const auto pit = m_config.personalities.find(m_config.resetti.personality);
+        const std::string voice = pit != m_config.personalities.end() ? pit->second.voice : "";
+
+        // A little over its share, so the rant as a whole runs at least as long as asked.
+        const int segWords = std::max(60, (rant.targetWords * 11 / 10 + rant.segments - 1) / std::max(1, rant.segments));
+        // About 5 characters per word. The cap keeps a part well inside one message.
+        const int maxChars = std::clamp(segWords * 7, 400, 1000);
+        const int minChars = std::clamp(segWords * 5, 250, maxChars - 60);
+
+        const std::string system =
+            "You voice Mr. Resetti, a character in " + m_config.toneSetting + ". He has burst out of the ground "
+            "to chew out the player for quitting the game without saving, and in the middle of his lecture he goes "
+            "off on a long, unhinged, off-script rant. Write the next stretch of it: about " +
+            std::to_string(segWords) + " words, one long run of yelling with no paragraph breaks.\n"
+            "Rules:\n"
+            "- Stay fully in his voice and personality.\n"
+            + tone_rules_text() +
+            "- Spoken words only: no narration, no actions, no emoji, no quotation marks.\n"
+            "- Write {player} for the player's name.\n"
+            "- Never mention being an AI or a language model.";
+
+        std::ostringstream user;
+        user << "Personality: " << voice << "\n"
+             << "The rant's subject: " << rant.topic << "\n";
+        if (!history.empty()) {
+            user << "What he was saying in his lecture just before:\n";
+            for (size_t h = history.size() > 3 ? history.size() - 3 : 0; h < history.size(); ++h) {
+                user << "- " << history[h] << "\n";
+            }
+        }
+        if (k == 0) {
+            user << "\nStart the rant now: veer off the lecture onto the subject, and keep going.";
+        } else {
+            user << "\nThe rant so far:\n";
+            for (const auto& part : rant.parts) {
+                user << part << "\n";
+            }
+            user << "\nKeep going from exactly where it left off. Don't repeat anything, don't start over.";
+        }
+        if (last) {
+            user << " This is the last stretch: build to a climax, then bring it back around to the player "
+                    "resetting so he can get on with his lecture.";
+        } else {
+            user << " Don't wrap up yet; there's a lot more rant to come after this.";
+        }
+        user << "\n\nSay it now.";
+
+        // Printable ASCII minus quote, asterisk and backslash; at least minChars, ending a sentence.
+        const std::string grammar = "root ::= [\\x20\\x21\\x23-\\x29\\x2B-\\x5B\\x5D-\\x7E]{" + std::to_string(minChars) +
+                                    "," + std::to_string(maxChars) + "} [.!?]\n";
+        const int maxTokens = maxChars / 3 + 32;
+
+        msg::LineStreamer streamer(&resolve_chitchat, const_cast<Names*>(&req.names));
+        streamer.drop_leading(std::string(kResettiName) + ":");
+        if (k == 0 && m_config.markGenerated) {
+            streamer.set_marker(kGeneratedMarker);
+        }
+        const int nextMsg = last ? rant.returnTo : kRantBase + k + 1;
+        std::vector<uint8_t> ending{ kCharControl, kContButton };
+        {
+            const auto jump = msg::jump_to(nextMsg);
+            ending.insert(ending.end(), jump.begin(), jump.end());
+        }
+        std::vector<uint8_t> giveUp{ kCharControl, kContButton }; // the model failed: back to his lecture
+        {
+            const auto jump = msg::jump_to(rant.returnTo);
+            giveUp.insert(giveUp.end(), jump.begin(), jump.end());
+        }
+
+        std::optional<Clock::time_point> firstWords;
+        bool noRoom = false;
+        auto push = [&](const std::vector<uint8_t>& bytes, const std::vector<uint8_t>& rescue, bool done) {
+            std::lock_guard lock(m_mutex);
+            if (m_stream.id != req.id || m_stream.cancelled) {
+                return false;
+            }
+            if (m_stream.bytes.size() + bytes.size() + rescue.size() + 2 > bufSize) {
+                return false;
+            }
+            if (!bytes.empty() && !firstWords) {
+                firstWords = Clock::now();
+            }
+            m_stream.bytes.insert(m_stream.bytes.end(), bytes.begin(), bytes.end());
+            m_stream.rescue = rescue;
+            m_stream.lastProgress = Clock::now();
+            m_stream.done = done;
+            return true;
+        };
+        auto cancelled = [&] {
+            std::lock_guard lock(m_mutex);
+            return m_stream.id != req.id || m_stream.cancelled;
+        };
+
+        // He waves his arms about as he starts.
+        push({ kCharControl, kContDemoNpc0, 0, 0, 0x22, kCharControl, kContSoundTrgSys, 0x05 }, giveUp, false);
+        std::string raw;
+        bool looping = false;
+        std::vector<uint8_t> held;
+        bool released = false;
+        bool refused = false;
+        auto send = [&](std::vector<uint8_t> bytes, bool final) {
+            if (refused || noRoom) {
+                return;
+            }
+            held.insert(held.end(), bytes.begin(), bytes.end());
+            if (!released) {
+                if (!final && word_count(streamer.text()) < kHeldWords) {
+                    return;
+                }
+                if (msg::looks_like_refusal(streamer.text())) {
+                    refused = true;
+                    return;
+                }
+                released = true;
+            }
+            if (!push(held, giveUp, false)) {
+                noRoom = true;
+            }
+            held.clear();
+        };
+        const auto text = complete("rant part " + std::to_string(k + 1) + " for Mr. Resetti", system, user.str(), grammar,
+                                   json::object(), maxTokens, 0.9f,
+                                   [&] { return refused || noRoom || looping || cancelled(); },
+                                   [&](std::string_view piece) {
+                                       raw.append(piece);
+                                       if (msg::is_looping(raw)) {
+                                           looping = true;
+                                           return;
+                                       }
+                                       send(streamer.feed(piece), false);
+                                   });
+        if (cancelled()) {
+            return;
+        }
+        std::string outcome = "ok";
+        bool finishedRant = last;
+        if (refused || (!text && !noRoom && !looping) || streamer.text().empty()) {
+            outcome = refused ? "refused by the model; back to his lecture" : "the model failed; back to his lecture";
+            push(giveUp, {}, true);
+            finishedRant = true;
+        } else {
+            if (!refused && !noRoom && !looping) {
+                send(streamer.finish(/*endMessage=*/false), true);
+            }
+            if (noRoom || looping) {
+                outcome = noRoom ? "ran out of message space; moved on" : "the model got stuck repeating itself; moved on";
+            }
+            if (!push(ending, {}, true)) {
+                finishedRant = true; // the stall rescue (back to his lecture) finishes it
+            }
+        }
+        {
+            std::lock_guard lock(m_mutex);
+            if (m_talk.special && m_talk.rant.planned) {
+                m_talk.rant.parts.push_back(streamer.text());
+                if (finishedRant && !last) {
+                    m_talk.rant.segments = k + 1; // no more parts
+                }
+            }
+        }
+        if (m_talkLog.enabled()) {
+            auto ms = [&](Clock::time_point t) {
+                return std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(t - started).count()) + " ms";
+            };
+            m_talkLog.write("RESETTI RANT  part " + std::to_string(k + 1) + " of " + std::to_string(rant.segments), {
+                { "Outcome", outcome },
+                { "Topic", rant.topic },
+                { "Timing", "first words " + (firstWords ? ms(*firstWords) : std::string("-")) + ", done " +
+                                ms(Clock::now()) },
+                { "Words", std::to_string(word_count(streamer.text())) + " (asked for about " + std::to_string(segWords) + ")" },
+                { "Then", finishedRant ? "back to his lecture (message " + std::to_string(rant.returnTo) + ")"
+                                       : "rant part " + std::to_string(k + 2) },
+                { "Shown", streamer.text().empty() ? "(nothing)" : streamer.text() },
+            });
+        }
+    }
+
     // ---- Live rewrites ----
 
     // Rewrites one message page by page, streaming each page into the text box as it's written.
@@ -2735,9 +3362,13 @@ ws     ::= [ \t\n]{0,4}
             }
 
             std::ostringstream ctx;
-            ctx << "Villager: " << v.name << "\n"
-                << "Built-in temperament: " << kLooksNames[std::clamp(v.looks, 0, 5)] << "\n"
-                << "Current mood: " << mood_name(v.mood) << "\n";
+            if (v.special) {
+                ctx << "Character: " << v.name << " (not a villager)\n";
+            } else {
+                ctx << "Villager: " << v.name << "\n"
+                    << "Built-in temperament: " << kLooksNames[std::clamp(v.looks, 0, 5)] << "\n"
+                    << "Current mood: " << mood_name(v.mood) << "\n";
+            }
             if (!v.catchphrase.empty()) {
                 ctx << "Their catchphrase (write it as {catchphrase}): " << v.catchphrase << "\n";
             }
@@ -2776,6 +3407,7 @@ ws     ::= [ \t\n]{0,4}
             bool leadSent = false;
             bool noRoom = false;
             bool refused = false;
+            bool looping = false;
             std::vector<uint8_t> held; // the first few words wait until it's clear the model isn't refusing
             auto sendWords = [&](std::vector<uint8_t> bytes, bool final) {
                 if (noRoom || refused) {
@@ -2811,9 +3443,13 @@ ws     ::= [ \t\n]{0,4}
             const auto text = complete("live rewrite of message " + std::to_string(plan.msgNo) + " page " +
                                            std::to_string(i + 1) + " for " + v.name,
                                        system, pageReq.user, pageReq.grammar, json::object(), pageReq.maxTokens, 0.6f,
-                                       [&] { return noRoom || refused || cancelled(); },
+                                       [&] { return noRoom || refused || looping || cancelled(); },
                                        [&](std::string_view piece) {
                                            raw.append(piece);
+                                           if (msg::is_looping(raw)) {
+                                               looping = true; // what's still unsent is dropped
+                                               return;
+                                           }
                                            sendWords(streamer.feed(piece), false);
                                        });
             if (cancelled()) {
@@ -2822,13 +3458,16 @@ ws     ::= [ \t\n]{0,4}
                 finished = true;
                 break;
             }
-            if (!noRoom && !refused && text && !streamer.text().empty()) {
+            if (!noRoom && !refused && !looping && text && !streamer.text().empty()) {
                 sendWords(streamer.finish(/*endMessage=*/false), true);
             }
             pageLogs.push_back({ page.text, raw.empty() ? "(nothing)" : raw, leadSent ? streamer.text() : "(not shown)" });
-            if (noRoom || refused || !text || !leadSent) {
+            if (noRoom || refused || looping || !text || !leadSent) {
                 // Out of buffer, refused or failed: the rest plays as the game wrote it.
-                outcome = std::string(noRoom ? "ran out of message space" : refused ? "the model refused" : "the model failed") +
+                outcome = std::string(noRoom    ? "ran out of message space"
+                                      : refused ? "the model refused"
+                                      : looping ? "the model got stuck repeating itself"
+                                                : "the model failed") +
                           " on page " + std::to_string(i + 1) + "; the rest played as the game wrote it";
                 push(leadSent ? after_words(i) : msg::original_from(t, i), {}, true);
                 finished = true;
@@ -2914,7 +3553,7 @@ ws     ::= [ \t\n]{0,4}
                 return false; // chit-chat is only written live, on demand
             }
             auto it = m_villagers.find(name);
-            return it != m_villagers.end() && now >= it->second.retryAfter &&
+            return it != m_villagers.end() && !it->second.special && now >= it->second.retryAfter &&
                    m_pools[name].size() < static_cast<size_t>(below);
         };
         auto lowestBelow = [&](int below) -> std::string {
@@ -2943,6 +3582,12 @@ ws     ::= [ \t\n]{0,4}
         // 0. A line the player is waiting for right now.
         if (m_live) {
             job.kind = Job::Kind::Live;
+            return true;
+        }
+        // 0b. Mr. Resetti's next phrase for the player to type, so it's ready when he asks.
+        if (m_liveReady && m_phraseWanted && m_phrases.empty() && m_config.resetti.generatedPhrase && resetti_ready_locked()) {
+            m_phraseWanted = false;
+            job.kind = Job::Kind::Phrase;
             return true;
         }
         // 1. Small talk for whoever the player is talking to.
@@ -3032,7 +3677,9 @@ ws     ::= [ \t\n]{0,4}
             switch (job.kind) {
             case Job::Kind::None: save_cache(); break;
             case Job::Kind::Live:
-                if (live && live->plan) {
+                if (live && live->rantSegment >= 0) {
+                    do_rant(*live);
+                } else if (live && live->plan) {
                     do_live_rewrite(*live);
                 } else if (live) {
                     do_live(*live);
@@ -3043,6 +3690,7 @@ ws     ::= [ \t\n]{0,4}
                 save_cache();
                 break;
             case Job::Kind::Rewrite: do_rewrite(job.personality, job.msgNo); break;
+            case Job::Kind::Phrase: do_phrase(); break;
             }
             if (saveRewrites) {
                 save_rewrites();
@@ -3083,6 +3731,12 @@ ws     ::= [ \t\n]{0,4}
     std::atomic<bool> m_preempt{ false };   // a live line is waiting: background requests stop
     std::map<std::string, std::deque<std::string>> m_recent; // worker only: last live lines per villager
     std::map<std::string, std::deque<std::string>> m_topicHistory; // worker only: last topics per villager
+    std::deque<std::string> m_rantTopics;                           // Mr. Resetti's recent rant topics (m_mutex)
+    std::vector<std::string> m_phrases;                             // phrases ready for him to use (m_mutex)
+    std::vector<std::string> m_usedPhrases;                         // used ones, for the next batch's prompt (m_mutex)
+    std::string m_activePhrase;                                     // the one he asked for (m_mutex)
+    bool m_phraseWanted = true;                                     // (m_mutex)
+    std::deque<std::string> m_recentPhrases;                        // worker only
     std::map<std::string, TopicKind> m_lastTopicKind;               // worker only
     std::deque<std::string> m_recentHeadlines;                      // worker only: across all villagers
 
@@ -3149,6 +3803,26 @@ void pc_dialog_begin_talk(const PCDialogVillager* villager, const void* actor, c
 void pc_dialog_end_talk(void) { acgc::dialog::service().end_talk(); }
 
 void pc_dialog_start(void) { acgc::dialog::service().ensure_started(); }
+
+void pc_dialog_begin_resetti(const void* actor, const uint8_t* player_name, int player_name_len) {
+    acgc::dialog::service().begin_resetti(actor, player_name, player_name ? player_name_len : 0);
+}
+
+void pc_dialog_end_resetti(const void* actor) { acgc::dialog::service().end_resetti(actor); }
+
+int pc_dialog_resetti_phrase(uint8_t* dst, int dst_size) {
+    if (dst == nullptr || dst_size <= 0) {
+        return 0;
+    }
+    return acgc::dialog::service().take_phrase(dst, dst_size);
+}
+
+int pc_dialog_phrase_matches(const uint8_t* typed, const uint8_t* phrase, int len) {
+    if (typed == nullptr || phrase == nullptr || len <= 0) {
+        return 0;
+    }
+    return acgc::dialog::service().phrase_matches(typed, phrase, len) ? 1 : 0;
+}
 
 void pc_dialog_note_talk(int msg_no, const char* kind) { acgc::dialog::service().note_talk(msg_no, kind); }
 

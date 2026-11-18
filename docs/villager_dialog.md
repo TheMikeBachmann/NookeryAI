@@ -95,6 +95,29 @@ Rewrites of the game's own messages (`rewrite_special`):
 The first full pass takes the built-in 8B model roughly 10-30 minutes of background GPU time per
 personality in your town. It's saved, so it only happens once.
 
+### Mr. Resetti
+
+Mr. Resetti (the `resetti` section of `personalities.json`) is wired up through his actors
+(`ac_npc_majin`, `majin2`, `majin3`, `majin4` and the event Resetti, `ac_ev_majin`). Don Resetti
+keeps his own lines. Each visit:
+
+1. Everything he says is rewritten live, page by page, in the personality named by
+   `resetti.personality`, the same way as villager rewrites. Pages with his special effects
+   (shaking text, big letters) stay as written.
+2. An off-script rant about one of the personality's `topics` goes in before the last message of
+   his lecture. His lecture is a chain of messages joined by `<NEXT_F n><FORCE_NEXT><CONTINUE>`.
+   The message that jumps to the last one is pointed at message `0x3F80` instead. The rant is
+   written live across `0x3F80`, `0x3F81`, … (a message holds about 1500 bytes), and the last part
+   jumps back to the lecture. By default it runs as long as that visit's own lecture (76-493 words,
+   so 1-4 messages); `rant_words` sets a fixed length. If the model fails, it jumps straight back.
+3. On the visits where he makes you type an apology (`ac_npc_majin3`, from the sixth reset on),
+   the phrase is generated. Phrases are written in batches at boot and kept if they fit the
+   16-character typing box. A typed reply counts if its letters and digits match, whatever the
+   case, spaces or punctuation. The game's own phrases are used if none are ready.
+
+The talk log shows each visit (RESETTI VISIT), where the rant went (RESETTI RANT PLANNED), each rant
+part, the phrases written, and what you typed against what he asked for (RESETTI PHRASE TYPED).
+
 ## Setup
 
 Built-in model (default, `"provider": "embedded"`):
