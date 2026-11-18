@@ -2,8 +2,10 @@
 
 Villagers talk in a voice you define. Two things change:
 
-- **Small talk** is replaced with fresh lines a language model writes from web sources you choose
-  for each personality (RSS/Atom feeds, Wikipedia, Reddit).
+- **Small talk** is written live by a language model the moment you talk to a villager, and the
+  words appear in the text box as they're generated. Each line can use the current weather, time
+  and mood, and topics from web sources you choose for each personality (RSS/Atom feeds,
+  Wikipedia, Reddit). Lines never run out or repeat.
 - **Everything else a town villager says**, such as trade offers, sales, gifts, letters, memories
   and tips, is rewritten in their personality's voice. The game's mechanics are untouched: items,
   prices, names, yes/no choices and what happens next all stay exactly as they were. Only the
@@ -18,16 +20,31 @@ network) plays the original line.
 
 ## How it works
 
-Small talk:
+Small talk, live (`live_small_talk`, built-in model only):
 
-1. The first time you talk to anyone, every villager in town is handed to a background worker.
+1. When the game starts, a background worker loads the model onto the GPU and warms it up.
+2. When a villager picks a small-talk line, the worker drops whatever background job it was doing
+   and writes one line for that villager from their personality, mood, the game's current weather,
+   time and date, a topic from the personality's sources (or everyday village life), and their last
+   few lines so they don't repeat themselves.
+3. The words are word-wrapped and paged as they're generated and handed to the message window. If
+   the window's text cursor catches up with the model, it waits a frame. With an 8B model on a
+   recent GPU, the first words are ready in about 0.1-0.5 s and the whole line in about 1-1.5 s,
+   faster than the game types it.
+4. Sources are only fetched in the background, never while you wait.
+
+Small talk, pre-written (the fallback, and what other providers use):
+
+1. The first time you talk to anyone, every villager in town is handed to the worker.
 2. For each villager the worker picks a personality, fetches that personality's sources (cached for
    `source_refresh_minutes`), and asks the model for `lines_per_batch` lines.
 3. Lines are kept in a per-villager pool in `dialog/cache.json` and survive restarts. Each line is
-   used once. The villager you last talked to is refilled first, anyone below `min_pool` next, and
-   pools are topped up to `pool_target` when there's nothing else to do.
-4. When a villager picks a small-talk line, a pooled line is word-wrapped to the dialog box and
-   shown instead. `{player}` and `{catchphrase}` become the real player name and catchphrase.
+   used once. The villager you last talked to is refilled first and anyone below `min_pool` next.
+   Without live lines, pools are also topped up to `pool_target` when there's nothing else to do.
+4. When a villager picks a small-talk line and live lines aren't available (model still loading,
+   provider isn't `embedded`, or a live line failed), a pooled line is shown instead.
+
+Either way, `{player}` and `{catchphrase}` become the real player name and catchphrase.
 
 The PC build also makes small talk come up more often than in the original (about 60% of
 conversations instead of about 25-40%). Trades, letters, memories and games still happen.
@@ -102,6 +119,7 @@ own lines and only replace small talk.
   "min_pool": 8,                 // refill a villager urgently below this many lines
   "pool_target": 24,             // keep topping up to this many when idle
   "rewrite_special": true,       // rewrite trades, letters, memories... in each personality's voice
+  "live_small_talk": true,       // write small talk as you talk (embedded provider only)
   "source_refresh_minutes": 60,
 
   "personalities": {
@@ -149,12 +167,15 @@ than large ones, so pick sources you'd be happy to see paraphrased.
 
 ## Performance and cost
 
-Small talk: each batch is one request with a short prompt, up to `max_material_items` source
-snippets, and `lines_per_batch` lines back (about 13 s with the built-in 8B model on a recent GPU).
-Rewrites: one request per message, about 2-6 s each.
+Live small talk: one short request per line, about 1-1.5 s with the built-in 8B model on a recent
+GPU, streamed as it's written. The start of the previous prompt stays in the model's memory, so
+back-to-back requests skip re-reading it. Pre-written small talk: each batch is one request with up
+to `max_material_items` source snippets and `lines_per_batch` lines back (about 13 s). Rewrites: one
+request per message, about 2-6 s each.
 
-Everything runs on a background thread, so the game never waits for the model. While a request is
-running, the model shares the GPU with the game. An 8B model at 4-bit needs roughly 5-6 GB of VRAM;
+Everything runs on a background thread, so the game never waits for the model. Background work
+(pools, rewrites, source fetches) stops the moment a live line is needed and picks up again
+afterwards. While a request is running, the model shares the GPU with the game. An 8B model at 4-bit needs roughly 5-6 GB of VRAM;
 on a smaller GPU try a 3B model. With Claude, lower `anthropic.effort` or pick a cheaper model to
 cut cost. A full rewrite pass is a few thousand requests, so it isn't cheap with an API.
 
@@ -165,16 +186,22 @@ keeps its original text. A larger model gives better rewrites if your GPU has ro
 
 Set `NOOKERY_DUMP_MESSAGES=<file>` to have the game write every message at startup, readable
 (`<file>`) and raw (`<file>.bin`). The log (`--log-dir`, or the data folder's `logs/`) records each
-batch and rewrite.
+batch and rewrite, and each live line with how long its first words and the whole line took.
+
+If a live line stalls for 10 seconds, the text box ends it so the game never hangs. If the model
+fails, the villager says a pooled line instead.
 
 ## Files
 
-- `pc/src/acgc_dialog.cpp`: config, source fetching, model requests, pools, rewrite queue
+- `pc/src/acgc_dialog.cpp`: config, source fetching, model requests, live lines, pools, rewrite
+  queue
 - `pc/src/acgc_dialog_messages.cpp`: message archive, page templates, rewrite prompt and checks,
-  word wrapping
+  word wrapping (whole text and streamed)
 - `pc/src/acgc_dialog_llama.cpp`: the built-in llama.cpp backend (`extern/llama.cpp` submodule)
 - `pc/include/pc_dialog.h`: C interface used by the game
 - `src/actor/ac_quest_talk_normal_init.c`: starts a conversation, registers conversation openers,
   arms small-talk lines, small-talk odds
 - `src/game/m_msg.c`, `m_msg_main.c_inc`, `m_msg_ctrl.c_inc`: archive snapshot, string widths,
   swapping lines in as messages load, conversation end
+- `src/game/m_msg_cursol.c_inc`: feeds a live line's new words to the text cursor and holds the
+  cursor when it catches up
