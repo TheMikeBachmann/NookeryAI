@@ -90,6 +90,32 @@ if (NOT TARGET nlohmann_json::nlohmann_json)
     FetchContent_MakeAvailable(nlohmann_json)
 endif ()
 
+# Embedded llama.cpp for generated villager dialog (pc/src/acgc_dialog_llama.cpp).
+# Runs on the GPU through Vulkan; needs the Vulkan SDK (glslc) at build time.
+if (WIN32 OR (UNIX AND NOT APPLE AND NOT ANDROID))
+    set(_nookery_llm_default ON)
+else ()
+    set(_nookery_llm_default OFF)
+endif ()
+option(NOOKERY_EMBEDDED_LLM "Build llama.cpp into the game for villager dialog" ${_nookery_llm_default})
+if (NOOKERY_EMBEDDED_LLM)
+    block()
+        set(CMAKE_CXX_STANDARD 17)  # llama.cpp is C++17; C++20 breaks its u8"" literals
+        set(BUILD_SHARED_LIBS OFF)
+        set(GGML_VULKAN ON)
+        set(GGML_NATIVE OFF)        # portable CPU code; the heavy lifting is on the GPU
+        set(GGML_OPENMP OFF)
+        set(LLAMA_OPENSSL OFF)
+        set(LLAMA_BUILD_COMMON OFF)
+        set(LLAMA_BUILD_TESTS OFF)
+        set(LLAMA_BUILD_TOOLS OFF)
+        set(LLAMA_BUILD_EXAMPLES OFF)
+        set(LLAMA_BUILD_SERVER OFF)
+        set(LLAMA_BUILD_APP OFF)
+        add_subdirectory(extern/llama.cpp EXCLUDE_FROM_ALL)
+    endblock()
+endif ()
+
 # Allow mixed C/C++ linkage
 set(CMAKE_C_EXTENSIONS ON)
 set(CMAKE_CXX_EXTENSIONS ON)
@@ -263,6 +289,8 @@ list(FILTER GAME_CXX_SOURCES EXCLUDE REGEX ".*/jsyswrapper_main\\.cpp$")
 set(PC_SOURCES
     ${PC_ROOT}/src/acgc_controller_ports.cpp
     ${PC_ROOT}/src/acgc_data.cpp
+    ${PC_ROOT}/src/acgc_dialog.cpp
+    ${PC_ROOT}/src/acgc_dialog_messages.cpp
     ${PC_ROOT}/src/acgc_disc.cpp
     ${PC_ROOT}/src/acgc_input_profiles.cpp
     ${PC_ROOT}/src/acgc_legacy_input.cpp
@@ -489,6 +517,7 @@ target_link_libraries(acgc PRIVATE
     borealis::data
     borealis::disc
     borealis::file_select
+    borealis::http
     borealis::log
     borealis::ui
     borealis::update
@@ -503,6 +532,12 @@ target_link_libraries(acgc PRIVATE
     aurora::si
     aurora::vi
 )
+
+if (NOOKERY_EMBEDDED_LLM)
+    target_sources(acgc PRIVATE ${PC_ROOT}/src/acgc_dialog_llama.cpp)
+    target_compile_definitions(acgc PRIVATE NOOKERY_EMBEDDED_LLM=1)
+    target_link_libraries(acgc PRIVATE llama)
+endif ()
 
 set_target_properties(acgc PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"

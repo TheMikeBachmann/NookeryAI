@@ -12,7 +12,10 @@
 #include "sys_matrix.h"
 #ifdef TARGET_PC
 #include "pc_bswap.h"
+#include "pc_dialog.h"
 #include "pc_settings.h"
+#include <stdint.h>
+#include <stdlib.h>
 #endif
 #ifdef MOUSE_INPUT
 #include "game_pointer.h"
@@ -153,9 +156,68 @@ extern void mMsg_aram_init() {
     mHandbill_aram_init();
 }
 
+#ifdef TARGET_PC
+/* pc_dialog.h: width of an inline string the window will print, for wrapping rewritten text. */
+int pc_dialog_string_code_width(int cont_code, int cut_article) {
+    mMsg_Window_c* msg_p = &mMsg_window;
+    u8* str = NULL;
+    int max_len = 0;
+    int article = mIN_ARTICLE_NONE;
+    int width;
+
+    if (cont_code >= mFont_CONT_CODE_PUT_STRING_ITEM0 && cont_code <= mFont_CONT_CODE_PUT_STRING_ITEM4) {
+        int no = cont_code - mFont_CONT_CODE_PUT_STRING_ITEM0;
+        str = msg_p->item_str[no];
+        max_len = mIN_ITEM_NAME_LEN;
+        article = msg_p->item_str_article[no];
+    } else if (cont_code >= mFont_CONT_CODE_PUT_STRING_FREE0 && cont_code <= mFont_CONT_CODE_PUT_STRING_FREE9) {
+        int no = cont_code - mFont_CONT_CODE_PUT_STRING_FREE0;
+        str = msg_p->free_str[no];
+        max_len = mMsg_FREE_STRING_LEN;
+        article = msg_p->free_str_article[no];
+    } else if (cont_code >= mFont_CONT_CODE_PUT_STRING_FREE10 && cont_code <= mFont_CONT_CODE_PUT_STRING_FREE19) {
+        int no = mMsg_FREE_STR10 + cont_code - mFont_CONT_CODE_PUT_STRING_FREE10;
+        str = msg_p->free_str[no];
+        max_len = mMsg_FREE_STRING_LEN;
+        article = msg_p->free_str_article[no];
+    }
+
+    if (str == NULL) {
+        return -1;
+    }
+    width = mFont_GetStringWidth(str, mMsg_Get_Length_String(str, max_len), TRUE);
+    if (!cut_article && article != mIN_ARTICLE_NONE) {
+        width += 24; /* "a ", "an ", "the ", "some " */
+    }
+    return width;
+}
+#endif
+
 extern void mMsg_aram_init2() {
     Msg_table_rom_start = JW_GetAramAddress(RESOURCE_MESSAGE_TABLE);
     Msg_rom_start = JW_GetAramAddress(RESOURCE_MESSAGE);
+
+#ifdef TARGET_PC
+    /* Snapshot the message archive for the villager dialog service (pc_dialog.h). */
+    {
+        u32 table_size = JW_GetResSizeFileNo(RESOURCE_MESSAGE_TABLE);
+        u32 data_size = JW_GetResSizeFileNo(RESOURCE_MESSAGE);
+        u8* table = (u8*)malloc(ALIGN_NEXT(table_size, 32) + 32);
+        u8* data = (u8*)malloc(ALIGN_NEXT(data_size, 32) + 32);
+
+        if (table != NULL && data != NULL && table_size != 0 && data_size != 0 && Msg_table_rom_start != 0 &&
+            Msg_rom_start != 0) {
+            u8* table_aligned = (u8*)ALIGN_NEXT((uintptr_t)table, 32);
+            u8* data_aligned = (u8*)ALIGN_NEXT((uintptr_t)data, 32);
+
+            _JW_GetResourceAram(Msg_table_rom_start, table_aligned, ALIGN_NEXT(table_size, 32));
+            _JW_GetResourceAram(Msg_rom_start, data_aligned, ALIGN_NEXT(data_size, 32));
+            pc_dialog_set_message_archive(table_aligned, table_size, data_aligned, data_size);
+        }
+        free(table);
+        free(data);
+    }
+#endif
 }
 
 extern void mMsg_ct(GAME* game) {

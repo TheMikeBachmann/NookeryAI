@@ -12,6 +12,13 @@
 #include "m_melody.h"
 #include "m_ledit_ovl.h"
 #include "libultra/libultra.h"
+#ifdef TARGET_PC
+#include "pc_dialog.h"
+
+/* Set when the chosen message is plain small talk (no trade/quest/letter/event logic),
+ * so it is safe to replace with generated dialog. */
+static int l_pc_dialog_chitchat;
+#endif
 
 static int aQMgr_decide_msg_trade(QUEST_MANAGER_ACTOR* manager, int looks);
 
@@ -143,10 +150,21 @@ enum {
 static aQMgr_normal_info_c l_normal_info;
 
 static u8 l_ki_prob[aQMgr_MSG_KI_NUM] = { 40, 30, 10, 10, 10 };
+#ifdef TARGET_PC
+/* Villager dialog (pc_dialog.h): favor small talk, which gets fresh generated lines.
+ * Original odds: normal_1 { 70, 30 }, normal_2 { 15, 35, 35, 15 }. Letters, trades,
+ * memories and games still come up, just less often. */
+static u8 l_normal_1_prob[] = { 80, 20 };
+#else
 static u8 l_normal_1_prob[] = { 70, 30 };
+#endif
 static u8 l_game_prob[aQMgr_DECIDE_MSG_GAME_MSG_NUM] = { 40, 60 };
 static u8 l_ev_prob[aQMgr_DECIDE_MSG_EV_NUM] = { 50, 50 };
+#ifdef TARGET_PC
+static u8 l_normal_2_prob[aQMgr_DECIDE_MSG_NORMAL_2_NUM] = { 10, 70, 12, 8 };
+#else
 static u8 l_normal_2_prob[aQMgr_DECIDE_MSG_NORMAL_2_NUM] = { 15, 35, 35, 15 };
+#endif
 static u8 l_trade_prob[aQMgr_DECIDE_MSG_TRADE_NUM] = { 25, 25, 25, 25 };
 static u8 l_normal_3_prob[aQMgr_DECIDE_MSG_NORMAL_3_NUM] = { 49, 17, 17, 17 };
 
@@ -1115,11 +1133,17 @@ static void aQMgr_set_give_and_take_mode_TAKE(QUEST_MANAGER_ACTOR* manager, int 
 
 static int aQMgr_decide_msg_ki_weather_time(QUEST_MANAGER_ACTOR* manager, int looks) {
     int ret_msg = aQMgr_get_msg_weather_time(manager, l_ki_weather_time[looks], 6, 2, 2);
+#ifdef TARGET_PC
+    l_pc_dialog_chitchat = TRUE;
+#endif
     return ret_msg;
 }
 
 static int aQMgr_decide_msg_ki_normal(QUEST_MANAGER_ACTOR* manager, int looks) {
     int ret_msg = l_ki_normal[looks];
+#ifdef TARGET_PC
+    l_pc_dialog_chitchat = TRUE;
+#endif
 
     return ret_msg + mQst_GetRandom(10);
 }
@@ -1330,6 +1354,9 @@ static int aQMgr_decide_msg_normal_3_msg_no(QUEST_MANAGER_ACTOR* manager, int lo
 
     if (idx >= 0 && idx < aQMgr_DECIDE_MSG_NORMAL_3_NUM) {
         ret_msg = (*msg_proc[idx])(manager, looks);
+#ifdef TARGET_PC
+        l_pc_dialog_chitchat = TRUE;
+#endif
     }
 
     return ret_msg;
@@ -2142,6 +2169,137 @@ static int aQMgr_change_NG_msg(int msg_no) {
     return ret_msg;
 }
 
+#ifdef TARGET_PC
+static void aQMgr_pc_dialog_fill_villager(PCDialogVillager* v, Animal_c* animal) {
+    int i;
+
+    mNpc_GetNpcWorldNameAnm(v->name, &animal->id);
+    v->name_len = mMsg_Get_Length_String(v->name, PC_DIALOG_NAME_LEN);
+    for (i = 0; i < PC_DIALOG_CATCHPHRASE_LEN; i++) {
+        v->catchphrase[i] = animal->catchphrase[i];
+    }
+    v->catchphrase_len = mMsg_Get_Length_String(v->catchphrase, PC_DIALOG_CATCHPHRASE_LEN);
+    v->looks = animal->id.looks;
+    v->mood = animal->mood;
+}
+
+/* Message numbers each built-in personality can open a conversation with, from the
+ * tables above; the dialog service follows their branches from there. The counts
+ * cover the random/weather/time offsets the decide functions add. */
+static void aQMgr_pc_dialog_register_roots(void) {
+    static const char* chat = "Small talk: the villager is just chatting with the player.";
+    static const char* gift = "The villager offers the player an item ({item...}) for free, or a little game with a "
+                              "prize. The villager gives; the player receives.";
+    static const char* swap = "The villager noticed an item the player has ({item0}) and wants it: they offer their "
+                              "own item in exchange, or Bells. The villager wants to GET the player's item.";
+    static const char* sell = "The villager offers to SELL one of their own items to the player for Bells.";
+    static const char* buy = "The villager wants to BUY or trade for an item the player has ({item0}).";
+    const struct {
+        int* table;
+        int count;
+        const char* situation;
+    } roots[] = {
+        { l_ki_normal, 10, chat },
+        { l_ki_weather_time, 30, "Small talk about the weather or the time of day." },
+        { l_ki_free_item, 3, gift },
+        { l_ki_ftr, 3, swap },
+        { l_ki_free_item_money, 3, sell },
+        { l_ev_special, 6, "The villager talks about a special event coming up in the village." },
+        { l_ev_cal, 8, "The villager talks about a date on the village calendar, like a birthday or event." },
+        { l_game_hint, 5, "The villager shares a tip about village life." },
+        { l_remove_yes, 2, "The villager is thinking about moving away from the village." },
+        { l_normal2_letter, 6, "The villager talks about a letter someone ({free15} is usually who wrote it) sent "
+                               "them, and may show it to the player." },
+        { l_normal2_memory, 6, "The villager remembers someone they knew or something that happened; {free...} "
+                               "are names, places and dates from the game." },
+        { l_trade_free_item, 5, gift },
+        { l_trade_ftr, 5, swap },
+        { l_trade_item, 5, buy },
+        { l_trade_free_item_money, 5, sell },
+        { l_normal3_normal, 10, chat },
+        { l_normal3_weather_time, 30, "Small talk about the weather or the time of day." },
+        { l_normal3_weather, 25, "Small talk about the weather." },
+        { l_normal3_season, 12, "Small talk about the season." },
+    };
+    int msgs[32];
+    int looks, r, k;
+
+    for (looks = 0; looks < 6; looks++) {
+        for (r = 0; r < (int)ARRAY_COUNT(roots); r++) {
+            for (k = 0; k < roots[r].count && k < (int)ARRAY_COUNT(msgs); k++) {
+                msgs[k] = roots[r].table[looks] + k;
+            }
+            pc_dialog_register_roots(looks, roots[r].situation, msgs, k);
+        }
+    }
+}
+
+/* Lets the dialog worker start writing lines for everyone in town, not just whoever was talked to first. */
+static void aQMgr_pc_dialog_register_town(void) {
+    static int registered;
+    Animal_c* animals = Save_Get(animals);
+    PCDialogVillager v;
+    int i;
+
+    if (registered) {
+        return;
+    }
+    registered = TRUE;
+
+    aQMgr_pc_dialog_register_roots();
+    for (i = 0; i < ANIMAL_NUM_MAX; i++) {
+        if (!mNpc_CheckFreeAnimalInfo(&animals[i])) {
+            aQMgr_pc_dialog_fill_villager(&v, &animals[i]);
+            pc_dialog_register_villager(&v);
+        }
+    }
+}
+
+static int aQMgr_pc_dialog_player_name(u8* player_name) {
+    int i;
+
+    for (i = 0; i < PLAYER_NAME_LEN; i++) {
+        player_name[i] = Now_Private->player_ID.player_name[i];
+    }
+    return mMsg_Get_Length_String(player_name, PLAYER_NAME_LEN);
+}
+
+/* Starts a conversation for the dialog service; returns FALSE for villagers it doesn't handle. */
+static int aQMgr_pc_dialog_begin(ACTOR* client, Animal_c* animal) {
+    PCDialogVillager v;
+    PCDialogScene scene;
+    u8 player_name[PLAYER_NAME_LEN];
+    int len;
+
+    aQMgr_pc_dialog_register_town();
+    if (animal == NULL || mNpc_CheckIslandAnimal(animal) == TRUE) {
+        pc_dialog_end_talk();
+        return FALSE;
+    }
+
+    aQMgr_pc_dialog_fill_villager(&v, animal);
+    scene.weather = Common_Get(weather);
+    scene.month = Common_Get(time.rtc_time.month);
+    scene.day = Common_Get(time.rtc_time.day);
+    scene.weekday = Common_Get(time.rtc_time.weekday);
+    scene.hour = Common_Get(time.rtc_time.hour);
+    scene.minute = Common_Get(time.rtc_time.min);
+    len = aQMgr_pc_dialog_player_name(player_name);
+    pc_dialog_begin_talk(&v, client, &scene, player_name, len);
+    return TRUE;
+}
+
+static void aQMgr_pc_dialog_apply(QUEST_MANAGER_ACTOR* manager, Animal_c* animal) {
+    PCDialogVillager v;
+    u8 player_name[PLAYER_NAME_LEN];
+    int len;
+
+    aQMgr_pc_dialog_fill_villager(&v, animal);
+    len = aQMgr_pc_dialog_player_name(player_name);
+    pc_dialog_arm(manager->msg_no, &v, player_name, len);
+}
+#endif
+
 static void aQMgr_talk_normal_select_talk(QUEST_MANAGER_ACTOR* manager) {
     ACTOR* client = *manager->client;
     Animal_c* animal = ((NPC_ACTOR*)client)->npc_info.animal;
@@ -2157,7 +2315,10 @@ static void aQMgr_talk_normal_select_talk(QUEST_MANAGER_ACTOR* manager) {
 
     player_event = mEv_SAVED_FIRSTJOB_PLR0 + Common_Get(player_no);
     aQMgr_normal_set_free_str(manager);
-    
+#ifdef TARGET_PC
+    l_pc_dialog_chitchat = FALSE;
+#endif
+
     if (!mLd_PlayerManKindCheck() && ((mEv_CheckFirstJob() == TRUE && !mEv_CheckEvent(player_event)) || mPr_CheckFirstJobHint(Now_Private) != TRUE)) {
         msg_no = aQMgr_decide_fj_hint_msg_no(looks);
         mPr_AddFirstJobHint(Now_Private);
@@ -2170,6 +2331,11 @@ static void aQMgr_talk_normal_select_talk(QUEST_MANAGER_ACTOR* manager) {
     }
 
     manager->msg_no = aQMgr_change_NG_msg(msg_no);
+#ifdef TARGET_PC
+    if (aQMgr_pc_dialog_begin(client, animal) && l_pc_dialog_chitchat) {
+        aQMgr_pc_dialog_apply(manager, animal);
+    }
+#endif
     mMsg_SET_CONTINUE_MSG_NUM(manager->msg_no);
     mMsg_SET_FORCENEXT();
 }

@@ -58,6 +58,9 @@ static void mMsg_Set_client_actor_p(mMsg_Window_c* msg_p, ACTOR* client_actor_p,
   else {
     msg_p->client_actor_p = NULL;
     msg_p->show_actor_name = FALSE;
+#ifdef TARGET_PC
+    pc_dialog_end_talk();
+#endif
   }
 }
 

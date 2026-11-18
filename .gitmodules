@@ -4,3 +4,6 @@
 [submodule "extern/borealis"]
 	path = extern/borealis
 	url = https://github.com/encounter/borealis.git
+[submodule "extern/llama.cpp"]
+	path = extern/llama.cpp
+	url = https://github.com/ggml-org/llama.cpp.git

@@ -330,6 +330,20 @@ static int mMsg_LoadMsgData(mMsg_Data_c* msg_data, int index, int cut) {
         u32 size;
 
         mFRm_set_msg_idx(index);
+
+#ifdef TARGET_PC
+        /* Generated villager small talk armed by the quest manager (pc_dialog.h). */
+        /* Otherwise, anything a town villager says can be a rewrite in their personality's voice. */
+        if (pc_dialog_take(index, msg_data->text_buf.data, mMsg_MSG_BUF_MAX) > 0 ||
+            pc_dialog_rewrite(index, mMsg_window.client_actor_p, msg_data->text_buf.data, mMsg_MSG_BUF_MAX) > 0) {
+            msg_data->msg_no = index;
+            msg_data->data_loaded = TRUE;
+            msg_data->msg_len = mMsg_Count_MsgData(msg_data->text_buf.data);
+            msg_data->cut = cut;
+            return TRUE;
+        }
+#endif
+
         mMsg_Get_MsgDataAddressAndSize(index, &addr, &size);
 
         if (addr != 0 && size != 0) {

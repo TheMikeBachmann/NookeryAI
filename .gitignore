@@ -48,3 +48,6 @@ include/compiler/gcc/stdlib.h
 
 # Release files
 dist/
+
+# Local CMake presets
+CMakeUserPresets.json
