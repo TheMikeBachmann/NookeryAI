@@ -118,6 +118,20 @@ keeps his own lines. Each visit:
 The talk log shows each visit (RESETTI VISIT), where the rant went (RESETTI RANT PLANNED), each rant
 part, the phrases written, and what you typed against what he asked for (RESETTI PHRASE TYPED).
 
+With `resetti.script` on (the default), steps 1 and 2 happen in one go instead: the first message
+of each talk starts a script, that message and everything it jumps on to (up to about 550 words)
+plus the rant if it goes in there, written by one model call as `Page N: ...` lines. Each message
+is shown from the script as its pages arrive, a sentence at a time. Each page gets a share of what
+fits in its message beside the message's codes, and anything that can't fit still runs its codes
+(music, animations, the jump on). If the model stops early, up to two more calls carry on from the
+next page. The talk log shows each script (RESETTI SCRIPT) with every page the model wrote.
+
+Known issue: he still repeats himself a lot over a whole visit with Llama 3.1 8B ("you're gonna
+pay for this", "goddamn menace", the player's name on nearly every page), and the last few pages
+of a long script drift from what the game's pages say. It reads as one tirade now, unlike page by
+page, but the variety isn't there yet. Ideas not tried: a bigger model; a ban list of phrases
+already used, passed to each later call; splitting a visit into shorter scripts.
+
 ## Setup
 
 Built-in model (default, `"provider": "embedded"`):
