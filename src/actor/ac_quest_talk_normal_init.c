@@ -2298,6 +2298,14 @@ static int aQMgr_pc_dialog_begin(ACTOR* client, Animal_c* animal) {
     return TRUE;
 }
 
+/* The conversation opens with the greeting, chosen before the talk itself (ac_quest_manager.c):
+ * begin it there so the greeting is said in the villager's voice too. */
+extern void aQMgr_pc_dialog_begin_hello(ACTOR* client) {
+    if (client != NULL) {
+        aQMgr_pc_dialog_begin(client, ((NPC_ACTOR*)client)->npc_info.animal);
+    }
+}
+
 static void aQMgr_pc_dialog_apply(QUEST_MANAGER_ACTOR* manager, Animal_c* animal) {
     PCDialogVillager v;
     u8 player_name[PLAYER_NAME_LEN];

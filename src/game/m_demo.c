@@ -8,6 +8,31 @@
 #include "m_event.h"
 #include "_mem.h"
 
+#ifdef TARGET_PC
+#include "m_name_table.h"
+#include "m_private.h"
+#include "pc_dialog.h"
+
+/* Tom Nook in every size of his shop, and on the part-time job (mastersp). */
+static void mDemo_pc_dialog_talk_start(ACTOR* actor) {
+    switch (actor->npc_id) {
+        case SP_NPC_SHOP_MASTER:
+        case SP_NPC_CONV_MASTER:
+        case SP_NPC_SUPER_MASTER:
+        case SP_NPC_DEPART_MASTER:
+        case SP_NPC_SHOP_MASTERSP:
+        case SP_NPC_SHOP_MASTERSP_2:
+        case SP_NPC_SHOP_MASTERSP_3:
+        case SP_NPC_SHOP_MASTERSP_4:
+            pc_dialog_begin_character(PC_DIALOG_CHARACTER_TOM_NOOK, actor, Now_Private->player_ID.player_name,
+                                      PLAYER_NAME_LEN);
+            break;
+        default:
+            break;
+    }
+}
+#endif
+
 /* Z-X */
 static f32 direct_vector[mDemo_DIRECT_NUM][2] = { { -1.0f, 0.0f },      { -F_SQRT2, F_SQRT2 }, { 0.0f, 1.0f },
                                                   { F_SQRT2, F_SQRT2 }, { 1.0f, 0.0f },        { F_SQRT2, -F_SQRT2 },
@@ -850,6 +875,14 @@ static int choice_demo() {
         memcpy(&demo->current, &demo->request[request_idx], sizeof(mDemo_Request_c));
         (*default_set_func[demo->current.type])();
 
+#ifdef TARGET_PC
+        /* A talk is starting (its proc sets the first message): tell the dialog service if the
+         * speaker is a character it rewrites. */
+        if ((demo->current.type == mDemo_TYPE_TALK || demo->current.type == mDemo_TYPE_SPEAK) &&
+            demo->current.actor != NULL) {
+            mDemo_pc_dialog_talk_start(demo->current.actor);
+        }
+#endif
         if (demo->current.proc != NULL) {
             (*demo->current.proc)(demo->current.actor);
         }

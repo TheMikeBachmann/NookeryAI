@@ -185,6 +185,11 @@ struct Config {
         bool generatedPhrase = true;   // a generated phrase for the player to type, when he asks for one
         bool script = true;            // write each stretch of his lecture in one go, not page by page
     } resetti;
+    // "tom_nook": Tom Nook, in his shop (all four of its sizes) and on the part-time job.
+    struct {
+        bool enabled = true;
+        std::string personality = "tom_nook";
+    } tomNook;
 };
 
 // Fallback when res/dialog/personalities.jsonc (the real defaults, with comments) is missing.
@@ -348,6 +353,10 @@ Config parse_config(const json& j) {
         c.resetti.rantWords = std::clamp(it->value("rant_words", c.resetti.rantWords), 0, 2000);
         c.resetti.generatedPhrase = it->value("generated_phrase", c.resetti.generatedPhrase);
         c.resetti.script = it->value("script", c.resetti.script);
+    }
+    if (auto it = j.find("tom_nook"); it != j.end() && it->is_object()) {
+        c.tomNook.enabled = it->value("enabled", c.tomNook.enabled);
+        c.tomNook.personality = it->value("personality", c.tomNook.personality);
     }
     // The message buffer is 1536 bytes; 1000 characters plus page codes still fits.
     c.maxLineChars = std::clamp(j.value("max_line_chars", c.maxLineChars), 100, 1000);
@@ -968,7 +977,8 @@ struct Talk {
     std::vector<std::string> history; // what the villager has said so far (as shown), for context
     // Mr. Resetti: one visit can be several talks with the same actor; the rant happens once.
     bool special = false;
-    bool firstPending = false; // Mr. Resetti: his talk's first message hasn't loaded yet
+    bool firstPending = false; // the talk's first message hasn't loaded yet
+    bool greeting = false;     // `situation` describes the greeting, for its message only
     int firstMsg = -1; // the first message of the talk that gets the rant (its lecture's length sets the rant's)
     struct Rant {
         bool planned = false;  // spliced in: the lecture now jumps to the rant
@@ -1284,8 +1294,17 @@ public:
         }
         talk.names.catchphrase.assign(v.catchphrase, v.catchphrase + std::clamp(v.catchphrase_len, 0, PC_DIALOG_CATCHPHRASE_LEN));
         std::lock_guard lock(m_mutex);
+        if (m_talk.active && !m_talk.special && m_talk.actor == actor && m_talk.villager == name) {
+            // Begun at the greeting already; this is the talk after it. Keep what's been said.
+            return;
+        }
         talk.personality = resolve_personality(m_villagers[name]).first;
-        m_talk = std::move(talk); // a new conversation: no history, no situation yet
+        // The greeting loads before the text box knows who's speaking; it's theirs.
+        talk.firstPending = true;
+        talk.greeting = true;
+        talk.situation = "The player has just walked up to the villager and started talking; the villager greets "
+                         "them.";
+        m_talk = std::move(talk); // a new conversation: no history yet
         m_hot = name;
         if (scene != nullptr) {
             m_scene = Scene{ true, scene->weather, scene->month, scene->day, scene->weekday, scene->hour, scene->minute };
@@ -1395,6 +1414,62 @@ public:
 
     // Main thread, from rewrite_live: true if message `msgNo` (`bytes`) jumps on to the lecture's
     // last message, so the rant goes in after it (the caller points its <NEXT_F> at kRantBase).
+    // ---- Other characters (Tom Nook) ----
+
+    static constexpr const char* kTomNookName = "Tom Nook";
+
+    // Main thread, when one of them starts a talk. Like a villager's conversation, but with a
+    // personality of their own and no small talk; ends when the text box lets go of them (end_talk).
+    void begin_character(int character, const void* actor, const uint8_t* player, int playerLen) {
+        ensure_started();
+        if (actor == nullptr || character != PC_DIALOG_CHARACTER_TOM_NOOK) {
+            return;
+        }
+        std::lock_guard lock(m_mutex);
+        if (m_talk.special) {
+            return; // Mr. Resetti's visit isn't interrupted
+        }
+        const auto& cfg = m_config.tomNook;
+        auto& info = m_villagers[kTomNookName];
+        info.name = kTomNookName;
+        info.special = true;
+        info.fixedPersonality = cfg.personality;
+        Talk talk;
+        // A shop visit is several talks with the same actor (buying, selling, chatting): each carries
+        // on from what he said in the last, so he doesn't repeat himself.
+        if (m_talk.villager == kTomNookName && m_talk.actor == actor) {
+            talk.history = std::move(m_talk.history);
+            if (talk.history.size() > 12) {
+                talk.history.erase(talk.history.begin(), talk.history.end() - 12);
+            }
+        }
+        std::string why;
+        if (!m_config.enabled || !cfg.enabled) {
+            why = "tom_nook.enabled is off";
+        } else if (!m_config.personalities.count(cfg.personality)) {
+            why = "personality \"" + cfg.personality + "\" isn't in personalities";
+        } else if (!m_config.liveRewrites || m_config.provider != Provider::Embedded) {
+            why = "live rewrites need the embedded model";
+        }
+        talk.active = why.empty();
+        talk.actor = actor;
+        talk.villager = kTomNookName;
+        talk.personality = cfg.personality;
+        talk.firstPending = true; // his talk's first message loads before the text box knows he's speaking
+        talk.names.player.assign(player, player + std::clamp(playerLen, 0, 16));
+        while (!talk.names.player.empty() && talk.names.player.back() == kCharSpace) {
+            talk.names.player.pop_back();
+        }
+        talk.situation = "Tom Nook, the raccoon who runs the village shop and holds the player's home loan, is "
+                         "talking with the player (in his shop, or about the house, the loan or a job for him).";
+        m_talk = std::move(talk);
+        m_hot.clear();
+        if (!why.empty() && !m_characterProblemLogged) {
+            m_characterProblemLogged = true;
+            m_talkLog.write("TOM NOOK", { { "Rewritten", "no (" + why + "); he says the game's own lines" } });
+        }
+    }
+
     // Main thread: true (once) if the rant goes in right after message `msgNo`, which is loading
     // now, planning it first if it's due; the caller points the message's <NEXT_F> at the rant.
     bool rant_goes_after_locked(int msgNo, const std::vector<uint8_t>& bytes) {
@@ -1516,9 +1591,9 @@ public:
         }
         {
             std::lock_guard lock(m_mutex);
-            if (m_talk.special && m_talk.firstPending) {
-                // The first message of each of Mr. Resetti's talks loads before the text box knows
-                // who's speaking (his forced talks start it themselves): it's his.
+            if (m_talk.active && m_talk.firstPending) {
+                // The first message of a talk (a villager's greeting, each of Mr. Resetti's talks)
+                // loads before the text box knows who's speaking: it's theirs.
                 m_talk.firstPending = false;
                 if (actor == nullptr) {
                     actor = m_talk.actor;
@@ -1663,6 +1738,10 @@ public:
         plan->msgNo = msgNo;
         plan->bufSize = static_cast<size_t>(dstSize);
         plan->situation = m_talk.situation;
+        if (m_talk.greeting) {
+            m_talk.greeting = false; // what comes after the greeting has a situation of its own
+            m_talk.situation.clear();
+        }
         for (int code : msg::string_codes(*tpl)) {
             for (bool cut : { false, true }) {
                 plan->widths[{ code, cut }] = game_string_width(static_cast<uint8_t>(code), cut, &m_talk.names);
@@ -4539,6 +4618,7 @@ private:
     std::shared_ptr<Script> m_script;  // guarded by m_mutex: Mr. Resetti's current script
     bool m_scriptWanted = false;       // guarded by m_mutex: m_script waits for the worker
     uint64_t m_scriptCounter = 0;      // guarded by m_mutex
+    bool m_characterProblemLogged = false; // guarded by m_mutex
     std::mt19937 m_rng{ std::random_device{}() };       // guarded by m_mutex
     std::mt19937 m_workerRng{ std::random_device{}() }; // worker thread only
     std::filesystem::path m_dir;
@@ -4630,6 +4710,10 @@ void pc_dialog_begin_resetti(const void* actor, const uint8_t* player_name, int 
 }
 
 void pc_dialog_end_resetti(const void* actor) { acgc::dialog::service().end_resetti(actor); }
+
+void pc_dialog_begin_character(int character, const void* actor, const uint8_t* player_name, int player_name_len) {
+    acgc::dialog::service().begin_character(character, actor, player_name, player_name ? player_name_len : 0);
+}
 
 int pc_dialog_resetti_phrase(uint8_t* dst, int dst_size) {
     if (dst == nullptr || dst_size <= 0) {

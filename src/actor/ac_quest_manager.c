@@ -464,6 +464,12 @@ static void aQMgr_set_talk_info(ACTOR* client) {
 
     l_client_p = client;
     msg_no = aQMgr_take_hello_msg_no(manager);
+#ifdef TARGET_PC
+    {
+        extern void aQMgr_pc_dialog_begin_hello(ACTOR * client);
+        aQMgr_pc_dialog_begin_hello(client);
+    }
+#endif
     mDemo_Set_msg_num(msg_no);
 
     if (animal->mood == mNpc_FEEL_SLEEPY) {

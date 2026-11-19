@@ -108,6 +108,17 @@ void pc_dialog_begin_resetti(const void* actor, const uint8_t* player_name, int 
 /* Mr. Resetti leaves (his actor is going away). */
 void pc_dialog_end_resetti(const void* actor);
 
+/* Characters other than villagers whose dialog is rewritten in a personality of their own. */
+enum {
+    PC_DIALOG_CHARACTER_TOM_NOOK = 1, /* personalities.json, "tom_nook" section */
+};
+
+/*
+ * One of those characters (`actor`) starts a talk. Everything said until the text box closes is
+ * rewritten live in their personality's voice, keeping every code (menus, prices, choices).
+ */
+void pc_dialog_begin_character(int character, const void* actor, const uint8_t* player_name, int player_name_len);
+
 /*
  * A generated phrase for the player to type as their apology, in game characters, padded
  * with spaces to `dst_size`. Returns 1 if one was ready, 0 if the game's own should be used.
