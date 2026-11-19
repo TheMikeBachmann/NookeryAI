@@ -183,6 +183,7 @@ struct Config {
         bool rant = true;              // splice an off-script rant in before his lecture's last message
         int rantWords = 0;             // how long the rant runs; 0 = as long as that visit's own lecture
         bool generatedPhrase = true;   // a generated phrase for the player to type, when he asks for one
+        bool script = true;            // write each stretch of his lecture in one go, not page by page
     } resetti;
 };
 
@@ -346,6 +347,7 @@ Config parse_config(const json& j) {
         c.resetti.rant = it->value("rant", c.resetti.rant);
         c.resetti.rantWords = std::clamp(it->value("rant_words", c.resetti.rantWords), 0, 2000);
         c.resetti.generatedPhrase = it->value("generated_phrase", c.resetti.generatedPhrase);
+        c.resetti.script = it->value("script", c.resetti.script);
     }
     // The message buffer is 1536 bytes; 1000 characters plus page codes still fits.
     c.maxLineChars = std::clamp(j.value("max_line_chars", c.maxLineChars), 100, 1000);
@@ -993,6 +995,59 @@ int plan_width(uint8_t code, bool cut, void* user) {
     return it == plan->widths.end() ? -1 : it->second;
 }
 
+// What follows page i's words when the rest of the message plays as the game wrote it: its
+// trailing codes, then the following pages and the tail.
+std::vector<uint8_t> after_words(const msg::Template& t, size_t i) {
+    std::vector<uint8_t> out = t.pages[i].trail;
+    if (i + 1 < t.pages.size()) {
+        out.insert(out.end(), t.separators[i].begin(), t.separators[i].end());
+        const auto rest = msg::original_from(t, i + 1);
+        out.insert(out.end(), rest.begin(), rest.end());
+    } else {
+        out.insert(out.end(), t.tail.begin(), t.tail.end());
+    }
+    return out;
+}
+
+// Mr. Resetti's lecture written in one go: every rewritable page of a chain of messages (one
+// message and everything it jumps on to), so it reads as one tirade instead of twenty separate
+// outbursts. The worker fills `texts` as the model writes; the game shows each message from it.
+// Guarded by the service's mutex.
+struct Script {
+    uint64_t id = 0;
+    std::vector<int> msgs;                                 // the chain, in order
+    std::map<int, std::shared_ptr<const RewritePlan>> plans; // each message's template and widths
+    struct Slot {
+        int msgNo;
+        size_t page;
+    };
+    std::vector<Slot> slots;        // the pages the model writes, in order
+    std::vector<std::string> texts; // per slot, as written so far
+    std::vector<bool> done;         // per slot: written in full
+    bool finished = false;          // the model stopped; a slot that isn't done plays as the game wrote it
+    int slot_of(int msgNo, size_t page) const {
+        for (size_t k = 0; k < slots.size(); ++k) {
+            if (slots[k].msgNo == msgNo && slots[k].page == page) {
+                return static_cast<int>(k);
+            }
+        }
+        return -1;
+    }
+};
+
+// One message being shown from a Script, a page at a time as its text arrives.
+struct ScriptFeed {
+    std::shared_ptr<Script> script;
+    std::shared_ptr<RewritePlan> plan; // this message (its own copy: the rant may retarget its jump)
+    size_t page = 0;
+    bool started = false; // this page's separator and setup are done
+    bool leadSent = false;
+    bool marked = false;
+    size_t consumed = 0; // characters of the page's text fed to the streamer
+    std::unique_ptr<msg::PageResolver> resolver;
+    std::unique_ptr<msg::LineStreamer> streamer;
+};
+
 // One message rewritten in a personality's voice. `pages` lines up with the
 // message template's pages; nullopt keeps that page's original text. A rewrite
 // with no pages at all marks a message that can't or shouldn't be rewritten.
@@ -1073,7 +1128,7 @@ private:
 };
 
 struct Job {
-    enum class Kind { None, Live, Chat, Rewrite, Phrase } kind = Kind::None;
+    enum class Kind { None, Live, Chat, Rewrite, Phrase, Script } kind = Kind::None;
     std::string villager;    // Chat
     std::string personality; // Rewrite
     int msgNo = -1;          // Rewrite
@@ -1292,6 +1347,8 @@ public:
                          "without saving (resetting).";
         m_talk = std::move(talk);
         m_hot.clear();
+        m_script.reset();
+        m_scriptWanted = false;
         if (m_talkLog.enabled()) {
             std::string why;
             if (!m_config.resetti.enabled) {
@@ -1316,6 +1373,8 @@ public:
         std::lock_guard lock(m_mutex);
         if (m_talk.special && m_talk.actor == actor) {
             m_talk = Talk{};
+            m_script.reset(); // stops the worker if it's still writing it
+            m_scriptWanted = false;
             if (m_stream.active) {
                 m_stream.active = false;
                 m_stream.cancelled = true;
@@ -1539,6 +1598,11 @@ public:
                 msg::retarget_next(sep, kRantBase);
             }
         }
+        if (m_talk.special && m_config.resetti.script) {
+            if (const int n = rewrite_from_script_locked(msgNo, *tpl, dstSize); n >= 0) {
+                return n;
+            }
+        }
         auto plan = std::make_shared<RewritePlan>();
         plan->msgNo = msgNo;
         plan->bufSize = static_cast<size_t>(dstSize);
@@ -1563,6 +1627,199 @@ public:
         m_armed.reset();
         m_cv.notify_all();
         return 0;
+    }
+
+    // ---- Mr. Resetti's script ----
+
+    // How much of his lecture one script covers (spoken words of the original): enough for a
+    // whole visit's lecture, small enough that prompt plus reply fit the model's context.
+    static constexpr int kScriptMaxWords = 550;
+
+    // Main thread: message `msgNo` of Mr. Resetti's visit is loading (`tpl` already points its jump
+    // at the rant if one goes in after it). Shows it from the current script, starting a new script
+    // from this message if it isn't in it. -1: not possible, rewrite it page by page instead.
+    int rewrite_from_script_locked(int msgNo, msg::Template& tpl, int dstSize) {
+        if (!m_script || !m_script->plans.count(msgNo)) {
+            if (!start_script_locked(msgNo, dstSize)) {
+                return -1;
+            }
+        }
+        auto plan = std::make_shared<RewritePlan>(*m_script->plans.at(msgNo));
+        if (plan->tpl.pages.size() != tpl.pages.size()) {
+            return -1; // can't happen: both are this message's template
+        }
+        plan->tpl = std::move(tpl);
+        plan->bufSize = static_cast<size_t>(dstSize);
+        plan->situation = m_talk.situation;
+        auto feed = std::make_shared<ScriptFeed>();
+        feed->script = m_script;
+        feed->plan = std::move(plan);
+
+        m_stream = Stream{};
+        m_stream.id = ++m_streamCounter;
+        m_stream.lastProgress = Clock::now();
+        m_stream.active = true;
+        m_stream.shownAt = Clock::now();
+        m_stream.rescue = msg::original_from(feed->plan->tpl, 0);
+        m_stream.feed = std::move(feed);
+        m_armed.reset();
+        serve_script_locked(); // whatever's written already
+        return 0;
+    }
+
+    // Main thread: a new script from `msgNo` through every message it jumps on to, for the worker
+    // to write. Replaces the old one (the player went somewhere it didn't cover).
+    bool start_script_locked(int msgNo, int dstSize) {
+        auto s = std::make_shared<Script>();
+        s->id = ++m_scriptCounter;
+        std::set<int> seen;
+        int words = 0;
+        for (int no = msgNo; no >= 0 && no < kRantBase && seen.insert(no).second && s->msgs.size() < 16;) {
+            const auto bytes = msg::original(no);
+            if (!bytes) {
+                break;
+            }
+            const int w = msg::spoken_words(*bytes);
+            if (!s->msgs.empty() && words + w > kScriptMaxWords) {
+                break; // the rest gets a script of its own when it loads
+            }
+            words += w;
+            s->msgs.push_back(no);
+            if (auto tpl = msg::parse_template(*bytes)) {
+                auto plan = std::make_shared<RewritePlan>();
+                plan->msgNo = no;
+                plan->bufSize = static_cast<size_t>(dstSize);
+                plan->situation = m_talk.situation;
+                for (int code : msg::string_codes(*tpl)) {
+                    for (bool cut : { false, true }) {
+                        plan->widths[{ code, cut }] = game_string_width(static_cast<uint8_t>(code), cut, &m_talk.names);
+                    }
+                }
+                for (size_t i = 0; i < tpl->pages.size(); ++i) {
+                    if (tpl->pages[i].rewritable) {
+                        s->slots.push_back({ no, i });
+                    }
+                }
+                plan->tpl = std::move(*tpl);
+                s->plans[no] = std::move(plan);
+            }
+            no = msg::next_target(*bytes);
+        }
+        if (s->slots.empty() || !s->plans.count(msgNo)) {
+            return false;
+        }
+        s->texts.resize(s->slots.size());
+        s->done.assign(s->slots.size(), false);
+        m_script = std::move(s);
+        m_scriptWanted = true;
+        m_preempt = true;
+        m_cv.notify_all();
+        return true;
+    }
+
+    // Adds whatever the script has for the message being shown to the stream: page by page, each
+    // page's words as they're written, every code of the message kept. Called from pump() (each
+    // frame the text box waits) and when the message loads.
+    void serve_script_locked() {
+        Stream& st = m_stream;
+        if (!st.feed || st.cancelled || st.done) {
+            return;
+        }
+        ScriptFeed& f = *st.feed;
+        const Script& s = *f.script;
+        const msg::Template& t = f.plan->tpl;
+        const size_t n = t.pages.size();
+        auto append = [&](const std::vector<uint8_t>& b) {
+            st.bytes.insert(st.bytes.end(), b.begin(), b.end());
+            st.lastProgress = Clock::now();
+        };
+        auto fits = [&](size_t extra) { return st.bytes.size() + extra + 2 <= f.plan->bufSize; };
+        auto finish_original = [&](const std::vector<uint8_t>& rest) { // the rest as the game wrote it
+            if (fits(rest.size())) {
+                append(rest);
+            } else {
+                append({ kCharControl, kContLast });
+            }
+            st.rescue.clear();
+            st.done = true;
+        };
+        while (f.page < n) {
+            const msg::Page& page = t.pages[f.page];
+            const bool last = f.page + 1 == n;
+            const int k = s.slot_of(f.plan->msgNo, f.page);
+            if (!f.started) {
+                f.started = true;
+                if (f.page > 0) {
+                    append(t.separators[f.page - 1]);
+                }
+                if (!page.rewritable || k < 0) {
+                    append(page.original);
+                    if (last) {
+                        append(t.tail);
+                    }
+                    ++f.page;
+                    f.started = false;
+                    continue;
+                }
+                f.resolver = std::make_unique<msg::PageResolver>(msg::PageResolver{ &page, &plan_width, f.plan.get() });
+                f.streamer = std::make_unique<msg::LineStreamer>(&msg::resolve_page_placeholder, f.resolver.get());
+                f.streamer->drop_leading(std::string(kResettiName) + ":");
+                if (m_config.markGenerated && !f.marked) {
+                    f.streamer->set_marker(kGeneratedMarker);
+                    f.marked = true;
+                }
+                f.consumed = 0;
+                f.leadSent = false;
+                st.rescue = msg::original_from(t, f.page);
+            }
+            const std::string& text = s.texts[k];
+            const bool pageDone = s.done[k];
+            if (s.finished && !pageDone) {
+                // The model stopped before finishing this page.
+                finish_original(f.leadSent ? after_words(t, f.page) : msg::original_from(t, f.page));
+                return;
+            }
+            std::vector<uint8_t> bytes;
+            if (text.size() > f.consumed) {
+                bytes = f.streamer->feed(std::string_view(text).substr(f.consumed));
+                f.consumed = text.size();
+            }
+            if (pageDone) {
+                const auto fin = f.streamer->finish(/*endMessage=*/false);
+                bytes.insert(bytes.end(), fin.begin(), fin.end());
+            }
+            if (!bytes.empty()) {
+                const bool firstBytes = !f.leadSent;
+                if (firstBytes) {
+                    bytes.insert(bytes.begin(), page.lead.begin(), page.lead.end());
+                }
+                if (!fits(bytes.size() + after_words(t, f.page).size())) {
+                    finish_original(firstBytes ? msg::original_from(t, f.page) : after_words(t, f.page));
+                    return;
+                }
+                append(bytes);
+                f.leadSent = true;
+                st.rescue = after_words(t, f.page);
+            }
+            if (!pageDone) {
+                return; // more to come
+            }
+            if (!f.leadSent) {
+                append(page.original); // the model wrote nothing usable for it
+            } else {
+                append(page.trail);
+                if (m_talk.special) {
+                    m_talk.history.push_back(f.streamer->text());
+                }
+            }
+            if (last) {
+                append(t.tail);
+            }
+            ++f.page;
+            f.started = false;
+        }
+        st.rescue.clear();
+        st.done = true;
     }
 
     int take(int msgNo, uint8_t* dst, int dstSize) {
@@ -1602,6 +1859,9 @@ public:
         std::lock_guard lock(m_mutex);
         if (!m_stream.active) {
             return 0;
+        }
+        if (m_stream.feed) {
+            serve_script_locked();
         }
         auto endNow = [&] {
             if (!m_stream.rescue.empty() && *len + static_cast<int>(m_stream.rescue.size()) <= bufSize) {
@@ -1664,6 +1924,7 @@ private:
         std::vector<uint8_t> rescue;
         Clock::time_point lastProgress{};
         Clock::time_point shownAt{};
+        std::shared_ptr<ScriptFeed> feed; // set: shown from Mr. Resetti's script (serve_script_locked)
     };
 
     struct LiveRequest {
@@ -3321,6 +3582,189 @@ private:
         }
     }
 
+    // ---- Mr. Resetti's script ----
+
+    // Writes the current script: one model call for every page of it, in order, so his lecture
+    // reads as one tirade. Each page is shown as soon as its words arrive. Worker thread.
+    void do_script() {
+        m_preempt = false;
+        const auto started = Clock::now();
+        std::shared_ptr<Script> s;
+        std::vector<std::string> history;
+        std::string situation;
+        Scene scene;
+        {
+            std::lock_guard lock(m_mutex);
+            s = m_script;
+            history = m_talk.history;
+            situation = m_talk.situation;
+            scene = m_scene;
+        }
+        if (!s) {
+            return;
+        }
+        const auto pit = m_config.personalities.find(m_config.resetti.personality);
+        const std::string voice = pit != m_config.personalities.end() ? pit->second.voice : "";
+
+        const std::string system =
+            "You voice Mr. Resetti, a character in " + m_config.toneSetting + ". You get everything he's about "
+            "to say, page by page (each page is one text box), as the game wrote it, and say all of it again in "
+            "his own voice as one continuous, coherent tirade.\n"
+            "Rules:\n" +
+            tone_rules_text() +
+            "- Each page keeps its own point and any joke or detail in it (what he's doing, what he noticed, what "
+            "he wants the player to do), on that page and in that order, but in completely new words: never copy "
+            "more than three words in a row from the game's text, and don't keep its sentences and tack on extra "
+            "ones. Say it all with his attitude, slang, swearing and insults. Keep every page about as long as "
+            "the original (a short page stays short), and never bring in what later pages say early. No new "
+            "facts, names, events or stories.\n"
+            "- Make it read like one speech that builds, cools off and flares up again with the original's own "
+            "beats. Vary everything from page to page: openers, insults, swearing, exclamations and rhythm. "
+            "Never use the same phrase, insult or exclamation twice anywhere in it, and don't repeat anything "
+            "he already said earlier in this visit.\n"
+            "- Keep everything that matters for what happens next: what he asks for, every number, and who "
+            "does what. He is the one speaking, to the player (\"you\").\n"
+            "- Write every {placeholder} of a page exactly as written, in that page; the game fills them in. "
+            "{player} is the player's name. Never make up new placeholders.\n"
+            "- If a page ends with a question, end it with the same question: the player answers it by picking "
+            "from fixed choices.\n"
+            "- Plain spoken words only: no emoji, no quotation marks, no actions or narration.\n"
+            "- Never mention being an AI or a game, and never comment on the task.";
+
+        std::ostringstream user;
+        user << "Character: Mr. Resetti (not a villager)\n";
+        if (!voice.empty()) {
+            user << "Personality: " << voice << "\n";
+        }
+        if (scene.valid) {
+            user << "Right now: " << scene_now(scene) << "\n";
+        }
+        if (!situation.empty()) {
+            user << "What's going on: " << situation << "\n";
+        }
+        if (!history.empty()) {
+            user << "Already said earlier in this visit (it's been on screen; carry on from it, don't repeat it):\n";
+            for (size_t h = history.size() > 8 ? history.size() - 8 : 0; h < history.size(); ++h) {
+                user << "- " << history[h] << "\n";
+            }
+        }
+        user << "\nWhat he says next, as the game wrote it. Lines marked (as is) stay exactly as they are and are "
+                "only there so you know the flow; rewrite every numbered page:\n";
+        std::string grammar = "root ::=";
+        std::string rules;
+        int maxTokens = 16;
+        size_t k = 0;
+        for (int no : s->msgs) {
+            const auto it = s->plans.find(no);
+            if (it == s->plans.end()) {
+                continue;
+            }
+            const auto& pages = it->second->tpl.pages;
+            for (size_t i = 0; i < pages.size(); ++i) {
+                if (k < s->slots.size() && s->slots[k].msgNo == no && s->slots[k].page == i) {
+                    const std::string label = "Page " + std::to_string(k + 1) + ": ";
+                    // The loose grammar: the strict one (sentence for sentence) runs at under half the
+                    // speed over a whole lecture and makes the model copy the game's wording.
+                    const auto pg = msg::free_page_grammar(pages[i], "p" + std::to_string(k));
+                    user << "Page " << (k + 1) << ": " << pages[i].text << "\n";
+                    grammar += " \"" + label + "\" " + pg.top + " \"\\n\"";
+                    rules += pg.rules;
+                    maxTokens += pg.totalWords * 2 + 8;
+                    ++k;
+                } else if (!pages[i].text.empty()) {
+                    user << "(as is) " << pages[i].text << "\n";
+                }
+            }
+        }
+        user << "\nWrite Page 1 to Page " << s->slots.size()
+             << " now, each on its own line starting with \"Page <number>: \". Every page keeps its own point and "
+                "details, in fresh words of his own: none of the game's sentences.";
+        grammar += "\n" + rules;
+        maxTokens = std::min(maxTokens, 2600);
+
+        // The reply is "Page 1: words\nPage 2: words\n...": each page's words go to its slot.
+        std::string raw;
+        int cur = -1;
+        std::string label;
+        bool looping = false;
+        std::optional<Clock::time_point> firstPage;
+        auto onPiece = [&](std::string_view piece) {
+            raw.append(piece);
+            std::lock_guard lock(m_mutex);
+            if (m_script != s) {
+                return;
+            }
+            for (const char ch : piece) {
+                if (ch == '\n') {
+                    if (cur >= 0) {
+                        s->done[cur] = true;
+                        if (!firstPage) {
+                            firstPage = Clock::now();
+                        }
+                    }
+                    cur = -1;
+                    label.clear();
+                } else if (cur >= 0) {
+                    s->texts[cur] += ch;
+                } else {
+                    label += ch;
+                    if (label.size() >= 8 && label.rfind("Page ", 0) == 0 && label.compare(label.size() - 2, 2, ": ") == 0) {
+                        const int no = std::atoi(label.c_str() + 5);
+                        if (no >= 1 && no <= static_cast<int>(s->slots.size())) {
+                            cur = no - 1;
+                        }
+                    }
+                }
+            }
+            if (cur >= 0 && msg::is_looping(s->texts[cur])) {
+                looping = true;
+            }
+        };
+        const auto text = complete("Mr. Resetti's lecture (" + std::to_string(s->slots.size()) + " pages)", system,
+                                   user.str(), grammar, json::object(), maxTokens, 0.7f,
+                                   [&] {
+                                       std::lock_guard lock(m_mutex);
+                                       return m_stopping.load() || looping || m_script != s;
+                                   },
+                                   onPiece);
+        std::vector<std::pair<std::string, std::string>> fields;
+        {
+            std::lock_guard lock(m_mutex);
+            s->finished = true; // anything not written in full plays as the game wrote it
+            if (!m_talkLog.enabled()) {
+                return;
+            }
+            const bool replaced = m_script != s;
+            size_t written = 0;
+            for (size_t j = 0; j < s->slots.size(); ++j) {
+                written += s->done[j] ? 1 : 0;
+            }
+            auto ms = [&](Clock::time_point tp) {
+                return std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(tp - started).count()) + " ms";
+            };
+            std::string msgs;
+            for (int no : s->msgs) {
+                msgs += (msgs.empty() ? "" : ", ") + std::to_string(no);
+            }
+            fields = {
+                { "Outcome", replaced ? "stopped (the visit moved on or ended)"
+                             : looping ? "the model got stuck repeating itself; the rest played as the game wrote it"
+                             : !text   ? "the model failed; unwritten pages played as the game wrote them"
+                                       : "ok" },
+                { "Messages", msgs },
+                { "Pages written", std::to_string(written) + " of " + std::to_string(s->slots.size()) },
+                { "Timing", "first page " + (firstPage ? ms(*firstPage) : std::string("-")) + ", done " + ms(Clock::now()) },
+            };
+            for (size_t j = 0; j < s->slots.size(); ++j) {
+                const auto& slot = s->slots[j];
+                const std::string p = "Page " + std::to_string(j + 1);
+                fields.push_back({ p + " original", s->plans.at(slot.msgNo)->tpl.pages[slot.page].text });
+                fields.push_back({ p + " model wrote", s->texts[j].empty() ? "(nothing)" : s->texts[j] });
+            }
+        }
+        m_talkLog.write("RESETTI SCRIPT", fields);
+    }
+
     // ---- Live rewrites ----
 
     // Rewrites one message page by page, streaming each page into the text box as it's written.
@@ -3708,6 +4152,12 @@ private:
             job.kind = Job::Kind::Live;
             return true;
         }
+        // 0a. Mr. Resetti's lecture, which he's started saying.
+        if (m_scriptWanted && m_script) {
+            m_scriptWanted = false;
+            job.kind = Job::Kind::Script;
+            return true;
+        }
         // 0b. Mr. Resetti's next phrase for the player to type, so it's ready when he asks.
         if (m_liveReady && m_phraseWanted && m_phrases.empty() && m_config.resetti.generatedPhrase && resetti_ready_locked()) {
             m_phraseWanted = false;
@@ -3815,6 +4265,7 @@ private:
                 break;
             case Job::Kind::Rewrite: do_rewrite(job.personality, job.msgNo); break;
             case Job::Kind::Phrase: do_phrase(); break;
+            case Job::Kind::Script: do_script(); break;
             }
             if (saveRewrites) {
                 save_rewrites();
@@ -3842,6 +4293,9 @@ private:
     Stream m_stream;                  // guarded by m_mutex
     uint64_t m_streamCounter = 0;     // guarded by m_mutex
     std::optional<LiveRequest> m_live; // guarded by m_mutex
+    std::shared_ptr<Script> m_script;  // guarded by m_mutex: Mr. Resetti's current script
+    bool m_scriptWanted = false;       // guarded by m_mutex: m_script waits for the worker
+    uint64_t m_scriptCounter = 0;      // guarded by m_mutex
     std::mt19937 m_rng{ std::random_device{}() };       // guarded by m_mutex
     std::mt19937 m_workerRng{ std::random_device{}() }; // worker thread only
     std::filesystem::path m_dir;

@@ -189,6 +189,20 @@ struct LivePageRequest {
     int maxChars = 0;
 };
 std::string live_page_system(const std::string& setting, const std::string& toneRules);
+
+// The GBNF rules a rewrite of `page` must follow (its sentences, placeholders and length caps),
+// with every rule name starting with `prefix` so several pages can share one grammar. `top` is
+// the rule for the whole page; there's no "root" unless `prefix` is empty.
+struct PageGrammar {
+    std::string top;
+    std::string rules;
+    int sentences = 0;
+    int totalWords = 0; // the page's word cap
+};
+PageGrammar page_grammar(const Page& page, const std::string& prefix);
+// A looser, much faster grammar for the same page: free text with the page's meaningful
+// placeholders in order, a length cap, and a "?" at the end if the player picks a choice next.
+PageGrammar free_page_grammar(const Page& page, const std::string& prefix);
 LivePageRequest live_page_request(const Page& page, const std::string& system, const std::string& context);
 
 // Builds the full message: rewritten pages where given (and valid), original pages elsewhere.

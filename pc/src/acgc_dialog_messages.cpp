@@ -1261,20 +1261,19 @@ int word_count_of(const std::string& s) {
 
 } // namespace
 
-LivePageRequest live_page_request(const Page& page, const std::string& system, const std::string& context) {
-    LivePageRequest r;
-    r.system = system;
+PageGrammar page_grammar(const Page& page, const std::string& prefix) {
+    PageGrammar out;
+    out.top = prefix + "root";
     const auto sentences = split_sentences(page.text);
-    r.user = context + "\nThe page to say now (say only this, in the villager's voice; it has " +
-             std::to_string(sentences.size()) + (sentences.size() == 1 ? " sentence" : " sentences") +
-             ", so say " + (sentences.size() == 1 ? "one" : "the same number") + "): " + page.text + "\n\nSay it now.";
+    out.sentences = static_cast<int>(sentences.size());
+    const std::string c = prefix + "c", w = prefix + "w", intro = prefix + "intro";
 
     // The page's sentences, one for one and in order, each with a word cap of about twice the
     // original's and the placeholders that carry meaning (items, prices, names) that it had.
     // {player} and {catchphrase} are flavor and may go anywhere. An optional interjection of up
     // to 6 words may come first. A page the player answers with a choice ends on "?". Words are
     // whole (a cap never cuts one), and nothing else can make up a placeholder.
-    std::string g = "root ::= (intro \" \")?";
+    std::string g = out.top + " ::= (" + intro + " \" \")?";
     // Printable ASCII only (the font has no glyphs for most else), minus space, quote, asterisk,
     // backslash and braces.
     // Names, dates and times are flavor too: the model may use the page's ones anywhere but
@@ -1288,13 +1287,11 @@ LivePageRequest live_page_request(const Page& page, const std::string& system, c
             flavorUsed.insert(key);
         }
     });
-    std::string rules = "c ::= [\\x21\\x23-\\x29\\x2B-\\x5B\\x5D-\\x7A\\x7C\\x7E] | \"{player}\" | \"{catchphrase}\"";
+    std::string rules = c + " ::= [\\x21\\x23-\\x29\\x2B-\\x5B\\x5D-\\x7A\\x7C\\x7E] | \"{player}\" | \"{catchphrase}\"";
     for (const auto& key : flavorUsed) {
         rules += " | \"{" + key + "}\"";
     }
-    rules += "\n"
-             "w ::= c{1,12}\n"
-                        "intro ::= w (\" \" w){0,5} [,.!?]\n";
+    rules += "\n" + w + " ::= " + c + "{1,12}\n" + intro + " ::= " + w + " (\" \" " + w + "){0,5} [,.!?]\n";
     const bool choice = asks_choice(page);
     int totalWords = 6;
     for (size_t k = 0; k < sentences.size(); ++k) {
@@ -1316,17 +1313,17 @@ LivePageRequest live_page_request(const Page& page, const std::string& system, c
             }
             stretchWords.push_back(word_count_of(sen.text.substr(std::min(from, sen.text.size()))));
         }
-        const std::string name = "t" + std::to_string(k);
+        const std::string name = prefix + "t" + std::to_string(k);
         g += (k == 0 ? " " : " \" \" ") + name;
         std::string rule = name + " ::=";
         for (size_t p = 0; p < stretchWords.size(); ++p) {
             const int cap = std::max(3, stretchWords[p] * 3 + 8); // a safety net, not a target
             totalWords += cap;
-            const std::string words = "(\" \" w){0," + std::to_string(cap - 1) + "}";
+            const std::string words = "(\" \" " + w + "){0," + std::to_string(cap - 1) + "}";
             if (p < keys.size()) {
-                rule += " \" \"? (w " + words + ")? \" \"? \"{" + keys[p] + "}\"";
+                rule += " \" \"? (" + w + " " + words + ")? \" \"? \"{" + keys[p] + "}\"";
             } else if (stretchWords[p] > 0) {
-                rule += " \" \"? w " + words; // ends on a word: the end mark follows it directly
+                rule += " \" \"? " + w + " " + words; // ends on a word: the end mark follows it directly
             }
         }
         const bool last = k + 1 == sentences.size();
@@ -1339,9 +1336,59 @@ LivePageRequest live_page_request(const Page& page, const std::string& system, c
         }
         rules += rule + "\n";
     }
-    r.grammar = g + "\n" + rules;
-    r.maxChars = totalWords * 7;
-    r.maxTokens = totalWords * 2 + 16;
+    out.rules = g + "\n" + rules;
+    out.totalWords = totalWords;
+    return out;
+}
+
+PageGrammar free_page_grammar(const Page& page, const std::string& prefix) {
+    PageGrammar out;
+    out.top = prefix + "root";
+    out.sentences = static_cast<int>(split_sentences(page.text).size());
+    static const std::set<std::string> kFlavor = { "player", "catchphrase", "town", "island", "year", "month",
+                                                   "weekday", "day", "hour", "minute", "second", "am_pm" };
+    std::vector<std::string> keys;
+    std::set<std::string> flavorUsed;
+    for_each_placeholder(page.text, [&](const std::string& key) {
+        if (!kFlavor.count(key)) {
+            keys.push_back(key);
+        } else if (key != "player" && key != "catchphrase") {
+            flavorUsed.insert(key);
+        }
+    });
+    // A cap on the whole page (about twice the original, so short pages stay short), shared out
+    // over the stretches between its forced placeholders.
+    const int origWords = std::max(1, word_count_of(page.text));
+    const int capWords = origWords * 2 + 16;
+    const int capChars = capWords * 7;
+    const int perChunk = std::max(24, capChars / static_cast<int>(keys.size() + 1));
+    // Printable ASCII minus quote, asterisk, backslash, braces and parentheses (no stage directions).
+    const std::string c = prefix + "c", chunk = prefix + "s";
+    std::string rules = c + " ::= [\\x20\\x21\\x23-\\x27\\x2B-\\x5B\\x5D-\\x7A\\x7C\\x7E] | \"{player}\" | \"{catchphrase}\"";
+    for (const auto& key : flavorUsed) {
+        rules += " | \"{" + key + "}\"";
+    }
+    rules += "\n" + chunk + " ::= " + c + "{0," + std::to_string(perChunk) + "}\n";
+    std::string g = out.top + " ::= [A-Za-z.{] " + chunk;
+    for (const auto& key : keys) {
+        g += " \"{" + key + "}\" " + chunk;
+    }
+    g += asks_choice(page) ? " \"?\"" : " [.!?]";
+    out.rules = g + "\n" + rules;
+    out.totalWords = capWords;
+    return out;
+}
+
+LivePageRequest live_page_request(const Page& page, const std::string& system, const std::string& context) {
+    LivePageRequest r;
+    r.system = system;
+    const PageGrammar pg = page_grammar(page, "");
+    r.user = context + "\nThe page to say now (say only this, in the villager's voice; it has " +
+             std::to_string(pg.sentences) + (pg.sentences == 1 ? " sentence" : " sentences") +
+             ", so say " + (pg.sentences == 1 ? "one" : "the same number") + "): " + page.text + "\n\nSay it now.";
+    r.grammar = pg.rules;
+    r.maxChars = pg.totalWords * 7;
+    r.maxTokens = pg.totalWords * 2 + 16;
     return r;
 }
 

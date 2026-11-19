@@ -232,6 +232,9 @@
     "rant_words": 0,            // how long the rant runs; 0 = as long as that visit's own lecture
     // When he makes the player type an apology, the phrase is generated (filthy) instead of the
     // game's own. Typing it right counts whatever the case, spaces or punctuation.
-    "generated_phrase": true
+    "generated_phrase": true,
+    // Write each stretch of his lecture in one go (one coherent tirade, shown as it's written)
+    // instead of a page at a time. false = page by page.
+    "script": true
   }
 }
