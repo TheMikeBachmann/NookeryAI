@@ -123,10 +123,16 @@ public:
     const std::string& text() const { return m_text; }
 
 private:
+    // Holds the first words back while they might be the model introducing its answer ("Here's
+    // what the villager says in their own voice:"), which is dropped.
+    void take_word(const std::string& word, std::vector<uint8_t>& out, bool last = false);
+    void flush_held(std::vector<uint8_t>& out, bool last);
     void commit_word(const std::string& word, std::vector<uint8_t>& out, bool last = false);
 
     ResolveFn m_resolve;
     void* m_user;
+    bool m_preambleCheck = true;
+    std::vector<std::string> m_held;
     std::string m_pending;
     std::string m_dropLeading;
     std::string m_text;

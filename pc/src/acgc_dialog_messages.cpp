@@ -876,7 +876,68 @@ void encode_word(const std::string& word, ResolveFn resolve, void* user, std::ve
     }
 }
 
+// A word lowercased, without surrounding punctuation.
+std::string bare_word(const std::string& word) {
+    std::string out;
+    for (const char ch : word) {
+        if (std::isalnum(static_cast<unsigned char>(ch)) || ch == '\'') {
+            out += static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        }
+    }
+    return out;
+}
+
+// Words a model's introduction of its own answer starts with.
+bool may_start_preamble(const std::string& word) {
+    static const std::set<std::string> kStarts = { "here", "here's", "heres", "sure", "okay", "ok", "certainly",
+                                                   "alright", "rewritten", "rewrite", "revised", "villager",
+                                                   "villager's", "page", "in", "as", "the", "this", "new",
+                                                   "response", "output", "and" };
+    return kStarts.count(bare_word(word)) != 0;
+}
+
+// Words that show an introduction is about the task, not something the villager would say.
+bool is_task_word(const std::string& word) {
+    static const std::set<std::string> kTask = { "villager", "villagers", "villager's", "voice", "page", "pages",
+                                                 "rewrite", "rewritten", "rewriting", "version", "here's", "heres",
+                                                 "says", "line", "lines", "original", "response", "dialogue",
+                                                 "dialog", "character", "personality", "style", "revised",
+                                                 "output", "text" };
+    return kTask.count(bare_word(word)) != 0;
+}
+
 } // namespace
+
+void LineStreamer::take_word(const std::string& word, std::vector<uint8_t>& out, bool last) {
+    if (!m_preambleCheck) {
+        commit_word(word, out, last);
+        return;
+    }
+    if (m_held.empty() && !may_start_preamble(word)) {
+        m_preambleCheck = false;
+        commit_word(word, out, last);
+        return;
+    }
+    m_held.push_back(word);
+    if (word.back() == ':') {
+        if (std::any_of(m_held.begin(), m_held.end(), is_task_word)) {
+            m_held.clear(); // the model introducing its answer: dropped
+            m_preambleCheck = false;
+            return;
+        }
+    }
+    if (last || m_held.size() >= 14 || std::strchr(".!?:", word.back()) != nullptr) {
+        flush_held(out, last);
+    }
+}
+
+void LineStreamer::flush_held(std::vector<uint8_t>& out, bool last) {
+    m_preambleCheck = false;
+    for (size_t k = 0; k < m_held.size(); ++k) {
+        commit_word(m_held[k], out, last && k + 1 == m_held.size());
+    }
+    m_held.clear();
+}
 
 void LineStreamer::commit_word(const std::string& word, std::vector<uint8_t>& out, bool last) {
     if (m_text.empty() && !m_dropLeading.empty() && word == m_dropLeading) {
@@ -940,7 +1001,7 @@ std::vector<uint8_t> LineStreamer::feed(std::string_view piece) {
     for (char c : piece) {
         if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
             if (!m_pending.empty()) {
-                commit_word(m_pending, out);
+                take_word(m_pending, out);
                 m_pending.clear();
             }
         } else {
@@ -957,8 +1018,11 @@ std::vector<uint8_t> LineStreamer::finish(bool endMessage) {
         m_pending.erase(open);
     }
     if (!m_pending.empty()) {
-        commit_word(m_pending, out, /*last=*/true);
+        take_word(m_pending, out, /*last=*/true);
         m_pending.clear();
+    }
+    if (!m_held.empty()) {
+        flush_held(out, /*last=*/true);
     }
     if (endMessage) {
         out.insert(out.end(), { kCharControl, kLast });
@@ -1132,7 +1196,9 @@ std::string live_page_system(const std::string& setting, const std::string& tone
            toneRules +
            "- Keep the original's sentences: one sentence for each of its sentences, in order, each saying what "
            "that one says. Put the personality into the wording of those sentences (attitude, slang, swearing, "
-           "insults inside them), not into extra sentences; you may start with an interjection of a few words. "
+           "insults inside them), not into extra sentences. Now and then you may start with a short interjection, "
+           "but usually start straight in on the original's first sentence, and never reuse an opener, insult or "
+           "exclamation already used in the conversation. "
            "No new facts, names, events or stories. The next pages are handled separately, so never get ahead of "
            "them.\n"
            "- Keep everything that matters for what happens next: what is offered, given, sold, bought, asked "

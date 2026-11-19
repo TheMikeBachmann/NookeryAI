@@ -881,6 +881,53 @@ std::vector<std::string> parse_lines(const std::string& text) {
 // ---------------------------------------------------------------------------
 // Service
 
+// The first `n` words of `s`, lowercased, letters, digits and apostrophes only: for spotting a
+// line that starts the same way as an earlier one ("What's wrong with you, kid?" again).
+std::string opening_key(const std::string& s, int n) {
+    std::string out, word;
+    int words = 0;
+    auto flush = [&] {
+        if (!word.empty() && words < n) {
+            out += (out.empty() ? "" : " ") + word;
+            ++words;
+        }
+        word.clear();
+    };
+    for (const char ch : s) {
+        if (std::isalnum(static_cast<unsigned char>(ch)) || ch == '\'') {
+            word += static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        } else {
+            flush();
+        }
+    }
+    flush();
+    return words == n ? out : std::string();
+}
+
+// The sentences of what's been said, for "don't reuse these" lists and opener checks.
+std::vector<std::string> said_sentences(const std::vector<std::string>& history) {
+    std::vector<std::string> out;
+    for (const auto& line : history) {
+        std::string cur;
+        for (size_t i = 0; i < line.size(); ++i) {
+            cur += line[i];
+            if (std::strchr(".!?", line[i]) != nullptr) {
+                while (i + 1 < line.size() && std::strchr(".!?", line[i + 1]) != nullptr) {
+                    cur += line[++i];
+                }
+                if (const auto b = cur.find_first_not_of(' '); b != std::string::npos) {
+                    out.push_back(cur.substr(b));
+                }
+                cur.clear();
+            }
+        }
+        if (const auto b = cur.find_first_not_of(' '); b != std::string::npos) {
+            out.push_back(cur.substr(b));
+        }
+    }
+    return out;
+}
+
 struct VillagerInfo {
     std::string name;
     std::string catchphrase;
@@ -2245,10 +2292,10 @@ ws     ::= [ \t\n]{0,4}
             if (model.is_relative()) {
                 model = dir() / model;
             }
-        } else if (auto found = llm::find_ollama_model(m_config.embeddedOllamaModel)) {
-            model = *found;
         } else if (auto dropped = first_gguf(dir() / "models")) {
             model = *dropped;
+        } else if (auto found = llm::find_ollama_model(m_config.embeddedOllamaModel)) {
+            model = *found;
         } else {
             Log.error("No model for the embedded provider: set embedded.model_path to a .gguf file, put one in "
                       "{}, or pull '{}' with Ollama so it can be reused",
@@ -3391,77 +3438,154 @@ private:
                     ctx << "- " << history[h] << "\n";
                 }
             }
+            // Older lines, as short phrases: without them a long talk (Mr. Resetti's lecture) keeps
+            // landing on the same few stock openers and insults.
+            std::set<std::string> usedOpeners; // the first words of every sentence said so far
+            {
+                const std::vector<std::string> older(history.begin(),
+                                                     history.size() > 4 ? history.end() - 4 : history.begin());
+                std::vector<std::string> phrases;
+                std::set<std::string> seen;
+                for (const auto& sentence : said_sentences(older)) {
+                    std::string phrase;
+                    int words = 0;
+                    for (size_t c = 0; c < sentence.size() && words < 8; ++c) {
+                        if (sentence[c] == ' ') {
+                            ++words;
+                        }
+                        if (words < 8) {
+                            phrase += sentence[c];
+                        }
+                    }
+                    if (const auto key = opening_key(phrase, 3); !key.empty() && seen.insert(key).second) {
+                        phrases.push_back(phrase);
+                    }
+                }
+                if (phrases.size() > 24) {
+                    phrases.erase(phrases.begin(), phrases.end() - 24);
+                }
+                if (!phrases.empty()) {
+                    ctx << "Phrases already used earlier in this conversation (never reuse them or start a sentence "
+                           "the same way; find new insults, exclamations and openers):\n";
+                    for (const auto& p : phrases) {
+                        ctx << "- " << p << "\n";
+                    }
+                }
+                for (const auto& sentence : said_sentences(history)) {
+                    if (auto key = opening_key(sentence, 3); !key.empty()) {
+                        usedOpeners.insert(std::move(key));
+                    }
+                }
+                // A page whose own original starts that way may keep it.
+                usedOpeners.erase(opening_key(page.text, 3));
+            }
             if (n > 1) {
                 ctx << "This is page " << (i + 1) << " of " << n << " of what they're saying now.\n";
             }
-            const auto pageReq = msg::live_page_request(page, system, ctx.str());
+            const std::string baseCtx = ctx.str();
 
+            // Two tries: if the first starts the way an earlier line did, it's dropped before any of it
+            // shows (the first words are held back anyway) and the second runs hotter, told not to.
             msg::PageResolver resolver{ &page, &plan_width, const_cast<RewritePlan*>(&plan) };
-            msg::LineStreamer streamer(&msg::resolve_page_placeholder, &resolver);
-            streamer.drop_leading(v.name + ":");
-            if (m_config.markGenerated && !marked) {
-                streamer.set_marker(kGeneratedMarker);
-                marked = true;
-            }
+            std::optional<msg::LineStreamer> streamerSlot;
             std::string raw;
             bool leadSent = false;
             bool noRoom = false;
             bool refused = false;
             bool looping = false;
-            std::vector<uint8_t> held; // the first few words wait until it's clear the model isn't refusing
-            auto sendWords = [&](std::vector<uint8_t> bytes, bool final) {
-                if (noRoom || refused) {
-                    return;
+            std::optional<std::string> text;
+            std::string avoid;    // the opener the first try repeated
+            std::string firstTry; // what the first try wrote, if it was dropped
+            for (int attempt = 0; attempt < 2; ++attempt) {
+                const auto pageReq = msg::live_page_request(
+                    page, system, attempt == 0 ? baseCtx : baseCtx + "Don't start with \"" + avoid + "\".\n");
+                streamerSlot.emplace(&msg::resolve_page_placeholder, &resolver);
+                msg::LineStreamer& streamer = *streamerSlot;
+                streamer.drop_leading(v.name + ":");
+                if (m_config.markGenerated && !marked) {
+                    streamer.set_marker(kGeneratedMarker);
                 }
-                held.insert(held.end(), bytes.begin(), bytes.end());
-                if (!leadSent) {
-                    if (!final && word_count(streamer.text()) < kHeldWords) {
+                raw.clear();
+                leadSent = noRoom = refused = looping = false;
+                bool repeatOpen = false;
+                std::vector<uint8_t> held; // the first few words wait until it's clear the model isn't refusing
+                auto sendWords = [&](std::vector<uint8_t> bytes, bool final) {
+                    if (noRoom || refused) {
                         return;
                     }
-                    if (msg::looks_like_refusal(streamer.text())) {
-                        refused = true;
+                    held.insert(held.end(), bytes.begin(), bytes.end());
+                    if (!leadSent) {
+                        if (!final && word_count(streamer.text()) < kHeldWords) {
+                            return;
+                        }
+                        if (msg::looks_like_refusal(streamer.text())) {
+                            refused = true;
+                            return;
+                        }
+                        if (attempt == 0) {
+                            if (auto key = opening_key(streamer.text(), 3); !key.empty() && usedOpeners.count(key)) {
+                                repeatOpen = true;
+                                avoid = streamer.text().substr(0, std::min<size_t>(streamer.text().size(), 40));
+                                if (const auto cut = avoid.find_first_of(",.!?"); cut != std::string::npos) {
+                                    avoid.resize(cut);
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    if (repeatOpen) {
                         return;
                     }
-                }
-                bytes = std::move(held);
-                held.clear();
-                if (bytes.empty()) {
-                    return;
-                }
-                if (!leadSent) {
-                    bytes.insert(bytes.begin(), page.lead.begin(), page.lead.end());
-                }
-                if (push(bytes, after_words(i), false)) {
-                    leadSent = true;
-                    if (!firstWords) {
-                        firstWords = Clock::now();
+                    bytes = std::move(held);
+                    held.clear();
+                    if (bytes.empty()) {
+                        return;
                     }
-                } else if (!cancelled()) {
-                    noRoom = true;
+                    if (!leadSent) {
+                        bytes.insert(bytes.begin(), page.lead.begin(), page.lead.end());
+                    }
+                    if (push(bytes, after_words(i), false)) {
+                        leadSent = true;
+                        marked = marked || m_config.markGenerated;
+                        if (!firstWords) {
+                            firstWords = Clock::now();
+                        }
+                    } else if (!cancelled()) {
+                        noRoom = true;
+                    }
+                };
+                text = complete("live rewrite of message " + std::to_string(plan.msgNo) + " page " +
+                                    std::to_string(i + 1) + " for " + v.name + (attempt ? " (retry)" : ""),
+                                system, pageReq.user, pageReq.grammar, json::object(), pageReq.maxTokens,
+                                attempt ? 0.9f : 0.6f,
+                                [&] { return noRoom || refused || looping || repeatOpen || cancelled(); },
+                                [&](std::string_view piece) {
+                                    raw.append(piece);
+                                    if (msg::is_looping(raw)) {
+                                        looping = true; // what's still unsent is dropped
+                                        return;
+                                    }
+                                    sendWords(streamer.feed(piece), false);
+                                });
+                if (!repeatOpen && !cancelled() && !noRoom && !refused && !looping && text && !streamer.text().empty()) {
+                    sendWords(streamer.finish(/*endMessage=*/false), true); // may still find a repeated opener
                 }
-            };
-            const auto text = complete("live rewrite of message " + std::to_string(plan.msgNo) + " page " +
-                                           std::to_string(i + 1) + " for " + v.name,
-                                       system, pageReq.user, pageReq.grammar, json::object(), pageReq.maxTokens, 0.6f,
-                                       [&] { return noRoom || refused || looping || cancelled(); },
-                                       [&](std::string_view piece) {
-                                           raw.append(piece);
-                                           if (msg::is_looping(raw)) {
-                                               looping = true; // what's still unsent is dropped
-                                               return;
-                                           }
-                                           sendWords(streamer.feed(piece), false);
-                                       });
+                if (!repeatOpen || cancelled()) {
+                    break;
+                }
+                firstTry = raw;
+            }
+            msg::LineStreamer& streamer = *streamerSlot;
             if (cancelled()) {
                 outcome = "cancelled (the player moved on)";
                 pageLogs.push_back({ page.text, raw, streamer.text() });
                 finished = true;
                 break;
             }
-            if (!noRoom && !refused && !looping && text && !streamer.text().empty()) {
-                sendWords(streamer.finish(/*endMessage=*/false), true);
-            }
-            pageLogs.push_back({ page.text, raw.empty() ? "(nothing)" : raw, leadSent ? streamer.text() : "(not shown)" });
+            pageLogs.push_back({ page.text,
+                                 (firstTry.empty() ? "" : "(dropped, repeated an opener: " + firstTry + ") ") +
+                                     (raw.empty() ? "(nothing)" : raw),
+                                 leadSent ? streamer.text() : "(not shown)" });
             if (noRoom || refused || looping || !text || !leadSent) {
                 // Out of buffer, refused or failed: the rest plays as the game wrote it.
                 outcome = std::string(noRoom    ? "ran out of message space"
