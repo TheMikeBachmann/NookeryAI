@@ -1182,6 +1182,24 @@ std::vector<uint8_t> original_from(const Template& t, size_t page) {
     return out;
 }
 
+std::vector<uint8_t> codes_only(const std::vector<uint8_t>& bytes) {
+    std::vector<uint8_t> out;
+    for (size_t i = 0; i < bytes.size();) {
+        const int size = std::max(1, code_size(&bytes[i], bytes.size() - i));
+        if (bytes[i] == kCharControl && size >= 2 && i + size <= bytes.size()) {
+            const uint8_t c = bytes[i + 1];
+            const bool printsOrWaits = c == kClear || c == kCursorSetTime || c == kButton ||
+                                       (c >= kPlayerName && c <= 74) || c == kSpace || c == kIslandName ||
+                                       c == kCutArticle || c == 117 || c == kAmPm;
+            if (!printsOrWaits) {
+                out.insert(out.end(), bytes.begin() + i, bytes.begin() + i + size);
+            }
+        }
+        i += size;
+    }
+    return out;
+}
+
 std::set<int> string_codes(const Template& t) {
     return t.pages.empty() ? std::set<int>{} : t.pages.front().messageStrings;
 }
@@ -1341,7 +1359,7 @@ PageGrammar page_grammar(const Page& page, const std::string& prefix) {
     return out;
 }
 
-PageGrammar free_page_grammar(const Page& page, const std::string& prefix) {
+PageGrammar free_page_grammar(const Page& page, const std::string& prefix, int maxChars) {
     PageGrammar out;
     out.top = prefix + "root";
     out.sentences = static_cast<int>(split_sentences(page.text).size());
@@ -1359,8 +1377,13 @@ PageGrammar free_page_grammar(const Page& page, const std::string& prefix) {
     // A cap on the whole page (about twice the original, so short pages stay short), shared out
     // over the stretches between its forced placeholders.
     const int origWords = std::max(1, word_count_of(page.text));
-    const int capWords = origWords * 2 + 16;
-    const int capChars = capWords * 7;
+    int capWords = origWords * 2 + 16;
+    int capChars = capWords * 7;
+    if (maxChars > 0 && maxChars < capChars) {
+        capChars = std::max(40, maxChars);
+        capWords = std::max(6, capChars / 7);
+    }
+    out.maxChars = capChars;
     const int perChunk = std::max(24, capChars / static_cast<int>(keys.size() + 1));
     // Printable ASCII minus quote, asterisk, backslash, braces and parentheses (no stage directions).
     const std::string c = prefix + "c", chunk = prefix + "s";

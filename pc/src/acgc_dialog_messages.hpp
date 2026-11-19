@@ -198,11 +198,17 @@ struct PageGrammar {
     std::string rules;
     int sentences = 0;
     int totalWords = 0; // the page's word cap
+    int maxChars = 0;   // free_page_grammar: the page's character cap
 };
 PageGrammar page_grammar(const Page& page, const std::string& prefix);
 // A looser, much faster grammar for the same page: free text with the page's meaningful
-// placeholders in order, a length cap, and a "?" at the end if the player picks a choice next.
-PageGrammar free_page_grammar(const Page& page, const std::string& prefix);
+// placeholders in order, a length cap (at most `maxChars` if that's given), and a "?" at the end
+// if the player picks a choice next.
+PageGrammar free_page_grammar(const Page& page, const std::string& prefix, int maxChars = 0);
+
+// Only the codes of `bytes` that don't print or wait for the player (music, animations, sounds,
+// branches): what must still run when the text they came with is skipped.
+std::vector<uint8_t> codes_only(const std::vector<uint8_t>& bytes);
 LivePageRequest live_page_request(const Page& page, const std::string& system, const std::string& context);
 
 // Builds the full message: rewritten pages where given (and valid), original pages elsewhere.

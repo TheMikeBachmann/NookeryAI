@@ -968,9 +968,13 @@ struct Talk {
     std::vector<std::string> history; // what the villager has said so far (as shown), for context
     // Mr. Resetti: one visit can be several talks with the same actor; the rant happens once.
     bool special = false;
+    bool firstPending = false; // Mr. Resetti: his talk's first message hasn't loaded yet
     int firstMsg = -1; // the first message of the talk that gets the rant (its lecture's length sets the rant's)
     struct Rant {
         bool planned = false;  // spliced in: the lecture now jumps to the rant
+        bool spliced = false;  // the message before it has been pointed at it
+        bool scripted = false; // part of a Script (written with the lecture, not by do_rant)
+        int afterMsg = -1;     // the lecture's message it goes in after
         int returnTo = -1;     // the lecture's message the rant hands back to
         int segments = 0;      // messages the rant is split over (a message holds ~1500 bytes)
         int targetWords = 0;
@@ -1020,8 +1024,12 @@ struct Script {
     struct Slot {
         int msgNo;
         size_t page;
+        int maxChars = 0;  // what fits in its message alongside the rest
+        int rantPart = -1; // >= 0: part of his rant (a message of its own), not a page of the lecture
     };
     std::vector<Slot> slots;        // the pages the model writes, in order
+    std::string rantTopic;          // set: the rant is part of this script
+    int rantWords = 0;              // per rant part
     std::vector<std::string> texts; // per slot, as written so far
     std::vector<bool> done;         // per slot: written in full
     bool finished = false;          // the model stopped; a slot that isn't done plays as the game wrote it
@@ -1326,6 +1334,7 @@ public:
         std::lock_guard lock(m_mutex);
         if (m_talk.special && m_talk.actor == actor) {
             m_talk.active = true; // his next talk on the same visit
+            m_talk.firstPending = true;
             return;
         }
         auto& info = m_villagers[kResettiName];
@@ -1338,6 +1347,7 @@ public:
         talk.actor = actor;
         talk.villager = kResettiName;
         talk.special = true;
+        talk.firstPending = true;
         talk.personality = info.fixedPersonality;
         talk.names.player.assign(player, player + std::clamp(playerLen, 0, 16));
         while (!talk.names.player.empty() && talk.names.player.back() == kCharSpace) {
@@ -1384,6 +1394,21 @@ public:
 
     // Main thread, from rewrite_live: true if message `msgNo` (`bytes`) jumps on to the lecture's
     // last message, so the rant goes in after it (the caller points its <NEXT_F> at kRantBase).
+    // Main thread: true (once) if the rant goes in right after message `msgNo`, which is loading
+    // now, planning it first if it's due; the caller points the message's <NEXT_F> at the rant.
+    bool rant_goes_after_locked(int msgNo, const std::vector<uint8_t>& bytes) {
+        if (!m_talk.special) {
+            return false;
+        }
+        plan_rant_locked(msgNo, bytes);
+        auto& r = m_talk.rant;
+        if (r.planned && !r.spliced && r.afterMsg == msgNo) {
+            r.spliced = true;
+            return true;
+        }
+        return false;
+    }
+
     bool plan_rant_locked(int msgNo, const std::vector<uint8_t>& bytes) {
         if (!m_talk.special || !m_config.resetti.rant || m_talk.rant.planned) {
             return false;
@@ -1401,6 +1426,7 @@ public:
         }
         auto& r = m_talk.rant;
         r.planned = true;
+        r.afterMsg = msgNo;
         r.returnTo = next;
         r.targetWords = m_config.resetti.rantWords > 0 ? m_config.resetti.rantWords
                                                        : std::max(150, msg::chain_words(m_talk.firstMsg));
@@ -1484,7 +1510,21 @@ public:
     // Main thread, from the message loader. Returns the bytes to show now (possibly 0 for a
     // live rewrite whose words are still coming), or -1 to play the message as the game wrote it.
     int rewrite(int msgNo, const void* actor, uint8_t* dst, int dstSize) {
-        if (!m_config.enabled || actor == nullptr || !msg::available()) {
+        if (!m_config.enabled || !msg::available()) {
+            return -1;
+        }
+        {
+            std::lock_guard lock(m_mutex);
+            if (m_talk.special && m_talk.firstPending) {
+                // The first message of each of Mr. Resetti's talks loads before the text box knows
+                // who's speaking (his forced talks start it themselves): it's his.
+                m_talk.firstPending = false;
+                if (actor == nullptr) {
+                    actor = m_talk.actor;
+                }
+            }
+        }
+        if (actor == nullptr) {
             return -1;
         }
         if (m_config.liveRewrites && m_config.provider == Provider::Embedded) {
@@ -1541,6 +1581,12 @@ public:
             if (!m_talk.special || !m_talk.rant.planned) {
                 return -1; // the archive's own message (never reached while no rant runs)
             }
+            if (m_liveReady && m_talk.actor == actor && m_script && m_script->plans.count(msgNo)) {
+                msg::Template tpl = m_script->plans.at(msgNo)->tpl; // written with his lecture
+                if (const int n = rewrite_from_script_locked(msgNo, tpl, dstSize); n >= 0) {
+                    return n;
+                }
+            }
             if (m_liveReady && m_talk.actor == actor) {
                 if (const int n = rewrite_rant(msgNo - kRantBase); n >= 0) {
                     return n;
@@ -1561,6 +1607,15 @@ public:
         auto tpl = original ? msg::parse_template(*original) : std::nullopt;
         std::lock_guard lock(m_mutex);
         if (!m_talk.active || m_talk.actor != actor || !m_config.personalities.count(m_talk.personality)) {
+            if (m_talk.special && m_talkLog.enabled() && original) {
+                m_talkLog.write("ORIGINAL LINE  " + m_talk.villager, {
+                    { "Message", std::to_string(msgNo) },
+                    { "Why", !m_talk.active             ? "his visit isn't being rewritten (see RESETTI VISIT)"
+                             : m_talk.actor != actor    ? "it loaded for a different speaker than him"
+                                                        : "his personality isn't in personalities" },
+                    { "Text", msg::describe(*original) },
+                });
+            }
             return -1;
         }
         if (auto it = m_situations.find(msgNo); it != m_situations.end()) {
@@ -1570,7 +1625,7 @@ public:
             if (m_talk.special && original) {
                 // Nothing to reword, but the rant may still need splicing in after it.
                 auto bytes = *original;
-                if (plan_rant_locked(msgNo, bytes) && msg::retarget_next(bytes, kRantBase) &&
+                if (rant_goes_after_locked(msgNo, bytes) && msg::retarget_next(bytes, kRantBase) &&
                     static_cast<int>(bytes.size()) <= dstSize) {
                     std::memcpy(dst, bytes.data(), bytes.size());
                     return static_cast<int>(bytes.size());
@@ -1586,7 +1641,7 @@ public:
             return -1;
         }
 
-        if (m_talk.special && plan_rant_locked(msgNo, *original)) {
+        if (rant_goes_after_locked(msgNo, *original)) {
             // The <NEXT_F> is in the tail or the last page's trailing codes; point it at the rant.
             msg::retarget_next(tpl->tail, kRantBase);
             for (auto& page : tpl->pages) {
@@ -1673,18 +1728,19 @@ public:
         auto s = std::make_shared<Script>();
         s->id = ++m_scriptCounter;
         std::set<int> seen;
+        std::vector<int> chain;
         int words = 0;
-        for (int no = msgNo; no >= 0 && no < kRantBase && seen.insert(no).second && s->msgs.size() < 16;) {
+        for (int no = msgNo; no >= 0 && no < kRantBase && seen.insert(no).second && chain.size() < 16;) {
             const auto bytes = msg::original(no);
             if (!bytes) {
                 break;
             }
             const int w = msg::spoken_words(*bytes);
-            if (!s->msgs.empty() && words + w > kScriptMaxWords) {
+            if (!chain.empty() && words + w > kScriptMaxWords) {
                 break; // the rest gets a script of its own when it loads
             }
             words += w;
-            s->msgs.push_back(no);
+            chain.push_back(no);
             if (auto tpl = msg::parse_template(*bytes)) {
                 auto plan = std::make_shared<RewritePlan>();
                 plan->msgNo = no;
@@ -1695,17 +1751,86 @@ public:
                         plan->widths[{ code, cut }] = game_string_width(static_cast<uint8_t>(code), cut, &m_talk.names);
                     }
                 }
-                for (size_t i = 0; i < tpl->pages.size(); ++i) {
-                    if (tpl->pages[i].rewritable) {
-                        s->slots.push_back({ no, i });
-                    }
-                }
                 plan->tpl = std::move(*tpl);
                 s->plans[no] = std::move(plan);
             }
             no = msg::next_target(*bytes);
         }
-        if (s->slots.empty() || !s->plans.count(msgNo)) {
+        if (!s->plans.count(msgNo)) {
+            return false;
+        }
+
+        // The rant, if it goes in after one of these messages: written in the same go, so it has
+        // the lecture to play off and doesn't wait behind it.
+        for (int no : chain) {
+            if (const auto bytes = msg::original(no)) {
+                plan_rant_locked(no, *bytes); // plans it if it's due here
+            }
+        }
+        auto& rant = m_talk.rant;
+        const bool withRant = rant.planned && !rant.scripted && rant.parts.empty() &&
+                              std::find(chain.begin(), chain.end(), rant.afterMsg) != chain.end();
+        if (withRant) {
+            // Lecture and rant share one reply, which has to fit the model's context with the prompt.
+            rant.targetWords = std::min(rant.targetWords, 400);
+            rant.segments = std::clamp((rant.targetWords + 139) / 140, 1, kRantMax);
+            rant.scripted = true;
+            s->rantTopic = rant.topic;
+            s->rantWords = std::max(60, (rant.targetWords * 11 / 10 + rant.segments - 1) / std::max(1, rant.segments));
+        }
+
+        // Each page's share of what fits in its message: the codes (animations, sounds, choices)
+        // always go in, and the model's words can't be allowed to push them out.
+        for (int no : chain) {
+            s->msgs.push_back(no);
+            if (const auto it = s->plans.find(no); it != s->plans.end()) {
+                const msg::Template& t = it->second->tpl;
+                size_t codeBytes = t.tail.size() + 48; // the end code, the generated marker, a margin
+                size_t textChars = 0;
+                for (size_t i = 0; i < t.pages.size(); ++i) {
+                    const auto& page = t.pages[i];
+                    codeBytes += page.rewritable ? page.lead.size() + page.trail.size() : page.original.size();
+                    textChars += page.rewritable ? std::max<size_t>(page.text.size(), 10) : 0;
+                    if (i > 0) {
+                        codeBytes += t.separators[i - 1].size();
+                    }
+                }
+                // Laid out, text takes a little more room than its characters (line and page breaks).
+                const double budget = std::max(0.0, (static_cast<double>(dstSize) - codeBytes) * 0.85);
+                for (size_t i = 0; i < t.pages.size(); ++i) {
+                    const auto& page = t.pages[i];
+                    if (page.rewritable) {
+                        const double share = static_cast<double>(std::max<size_t>(page.text.size(), 10)) /
+                                             static_cast<double>(std::max<size_t>(textChars, 1));
+                        s->slots.push_back({ no, i, static_cast<int>(budget * share), -1 });
+                    }
+                }
+            }
+            if (withRant && no == rant.afterMsg) {
+                for (int k = 0; k < rant.segments; ++k) {
+                    auto plan = std::make_shared<RewritePlan>();
+                    plan->msgNo = kRantBase + k;
+                    plan->bufSize = static_cast<size_t>(dstSize);
+                    plan->situation = m_talk.situation;
+                    for (bool cut : { false, true }) {
+                        plan->widths[{ kContPlayerName, cut }] = game_string_width(kContPlayerName, cut, &m_talk.names);
+                    }
+                    msg::Page page;
+                    page.rewritable = true;
+                    if (k == 0) { // he waves his arms about as he starts
+                        page.lead = { kCharControl, kContDemoNpc0, 0, 0, 0x22, kCharControl, kContSoundTrgSys, 0x05 };
+                    }
+                    plan->tpl.pages.push_back(std::move(page));
+                    plan->tpl.tail = { kCharControl, kContButton };
+                    const auto jump = msg::jump_to(k + 1 < rant.segments ? kRantBase + k + 1 : rant.returnTo);
+                    plan->tpl.tail.insert(plan->tpl.tail.end(), jump.begin(), jump.end());
+                    s->plans[plan->msgNo] = std::move(plan);
+                    s->msgs.push_back(kRantBase + k);
+                    s->slots.push_back({ kRantBase + k, 0, std::clamp(s->rantWords * 7, 400, 1000), k });
+                }
+            }
+        }
+        if (s->slots.empty()) {
             return false;
         }
         s->texts.resize(s->slots.size());
@@ -1738,10 +1863,24 @@ public:
             if (fits(rest.size())) {
                 append(rest);
             } else {
-                append({ kCharControl, kContLast });
+                // No room for its words: still run its codes (music, animations) and its ending
+                // (choices, the jump on), or the game is left with Mr. Resetti's music playing.
+                const size_t tailAt = rest.size() >= t.tail.size() ? rest.size() - t.tail.size() : 0;
+                auto codes = msg::codes_only(std::vector<uint8_t>(rest.begin(), rest.begin() + tailAt));
+                codes.insert(codes.end(), rest.begin() + tailAt, rest.end());
+                append(fits(codes.size()) ? codes : std::vector<uint8_t>{ kCharControl, kContLast });
             }
             st.rescue.clear();
             st.done = true;
+        };
+        // Where the last whole sentence of `text` ends (just past its mark), or 0.
+        auto sentence_end = [](const std::string& text, size_t limit) -> size_t {
+            for (size_t p = std::min(limit, text.size()); p-- > 1;) {
+                if (std::strchr(".!?", text[p - 1]) != nullptr && text[p] == ' ') {
+                    return p;
+                }
+            }
+            return 0;
         };
         while (f.page < n) {
             const msg::Page& page = t.pages[f.page];
@@ -1772,16 +1911,26 @@ public:
                 f.leadSent = false;
                 st.rescue = msg::original_from(t, f.page);
             }
-            const std::string& text = s.texts[k];
             const bool pageDone = s.done[k];
             if (s.finished && !pageDone) {
                 // The model stopped before finishing this page.
                 finish_original(f.leadSent ? after_words(t, f.page) : msg::original_from(t, f.page));
                 return;
             }
+            // Whole sentences only, so a page that runs into its length cap (which makes the grammar
+            // end it on the spot) loses its unfinished last sentence instead of stopping mid-word.
+            std::string_view text = s.texts[k];
+            if (!pageDone) {
+                text = text.substr(0, sentence_end(s.texts[k], text.size()));
+            } else if (!page.beforeChoice && s.slots[k].maxChars > 0 &&
+                       static_cast<int>(text.size()) >= s.slots[k].maxChars * 9 / 10) {
+                if (const size_t end = sentence_end(s.texts[k], text.size() - 1); end >= f.consumed && end > 0) {
+                    text = text.substr(0, end);
+                }
+            }
             std::vector<uint8_t> bytes;
             if (text.size() > f.consumed) {
-                bytes = f.streamer->feed(std::string_view(text).substr(f.consumed));
+                bytes = f.streamer->feed(text.substr(f.consumed));
                 f.consumed = text.size();
             }
             if (pageDone) {
@@ -1793,7 +1942,8 @@ public:
                 if (firstBytes) {
                     bytes.insert(bytes.begin(), page.lead.begin(), page.lead.end());
                 }
-                if (!fits(bytes.size() + after_words(t, f.page).size())) {
+                // Room for these words and, at least, the codes of everything after them.
+                if (!fits(bytes.size() + msg::codes_only(after_words(t, f.page)).size() + t.tail.size())) {
                     finish_original(firstBytes ? msg::original_from(t, f.page) : after_words(t, f.page));
                     return;
                 }
@@ -1864,10 +2014,14 @@ public:
             serve_script_locked();
         }
         auto endNow = [&] {
+            const auto rescueCodes = msg::codes_only(m_stream.rescue); // its codes, if its words don't fit
             if (!m_stream.rescue.empty() && *len + static_cast<int>(m_stream.rescue.size()) <= bufSize) {
                 // Finish the message as the game wrote it, so its choices and branches still work.
                 std::memcpy(buf + *len, m_stream.rescue.data(), m_stream.rescue.size());
                 *len += static_cast<int>(m_stream.rescue.size());
+            } else if (!rescueCodes.empty() && *len + static_cast<int>(rescueCodes.size()) <= bufSize) {
+                std::memcpy(buf + *len, rescueCodes.data(), rescueCodes.size());
+                *len += static_cast<int>(rescueCodes.size());
             } else if (*len + 2 <= bufSize) {
                 buf[*len] = kCharControl;
                 buf[*len + 1] = kContLast;
@@ -3661,11 +3815,34 @@ private:
             }
             const auto& pages = it->second->tpl.pages;
             for (size_t i = 0; i < pages.size(); ++i) {
-                if (k < s->slots.size() && s->slots[k].msgNo == no && s->slots[k].page == i) {
+                if (k < s->slots.size() && s->slots[k].msgNo == no && s->slots[k].rantPart >= 0) {
+                    // His off-script rant: free yelling about its subject, as long as asked.
+                    const auto& slot = s->slots[k];
+                    const int parts = static_cast<int>(std::count_if(s->slots.begin(), s->slots.end(),
+                                                                     [](const Script::Slot& x) { return x.rantPart >= 0; }));
+                    const bool lastPart = slot.rantPart + 1 == parts;
+                    const int maxChars = std::max(200, slot.maxChars);
+                    const int minChars = std::clamp(s->rantWords * 5, 150, maxChars - 60);
+                    user << "Page " << (k + 1) << ": (HERE HE GOES OFF-SCRIPT: a long, unhinged rant about " << s->rantTopic
+                         << ", part " << (slot.rantPart + 1) << " of " << parts << ", about " << s->rantWords
+                         << " words of nonstop yelling in one go; "
+                         << (slot.rantPart == 0 ? "veer off the lecture onto the subject. " : "carry straight on from the last part. ")
+                         << (lastPart ? "Build to a climax, then swing back to the player resetting so he can get on with "
+                                        "his lecture."
+                                      : "Don't wrap up yet.")
+                         << " This page doesn't follow the game's text; it's his.)\n";
+                    const std::string pre = "p" + std::to_string(k);
+                    grammar += " \"Page " + std::to_string(k + 1) + ": \" " + pre + "root \"\\n\"";
+                    rules += pre + "c ::= [\\x20\\x21\\x23-\\x27\\x2B-\\x5B\\x5D-\\x7A\\x7C\\x7E] | \"{player}\"\n" + pre +
+                             "root ::= [A-Za-z] " + pre + "c{" + std::to_string(minChars) + "," + std::to_string(maxChars) +
+                             "} [.!?]\n";
+                    maxTokens += maxChars / 3 + 16;
+                    ++k;
+                } else if (k < s->slots.size() && s->slots[k].msgNo == no && s->slots[k].page == i) {
                     const std::string label = "Page " + std::to_string(k + 1) + ": ";
                     // The loose grammar: the strict one (sentence for sentence) runs at under half the
                     // speed over a whole lecture and makes the model copy the game's wording.
-                    const auto pg = msg::free_page_grammar(pages[i], "p" + std::to_string(k));
+                    const auto pg = msg::free_page_grammar(pages[i], "p" + std::to_string(k), s->slots[k].maxChars);
                     user << "Page " << (k + 1) << ": " << pages[i].text << "\n";
                     grammar += " \"" + label + "\" " + pg.top + " \"\\n\"";
                     rules += pg.rules;
@@ -3680,7 +3857,9 @@ private:
              << " now, each on its own line starting with \"Page <number>: \". Every page keeps its own point and "
                 "details, in fresh words of his own: none of the game's sentences.";
         grammar += "\n" + rules;
-        maxTokens = std::min(maxTokens, 2600);
+        // What's left of the context after the prompt (about 3.2 characters a token).
+        const int promptTokens = static_cast<int>((system.size() + user.str().size()) * 10 / 32) + 64;
+        maxTokens = std::clamp(maxTokens, 256, std::max(256, m_config.embeddedContext - promptTokens));
 
         // The reply is "Page 1: words\nPage 2: words\n...": each page's words go to its slot.
         std::string raw;
