@@ -1030,6 +1030,7 @@ struct Script {
     std::vector<Slot> slots;        // the pages the model writes, in order
     std::string rantTopic;          // set: the rant is part of this script
     int rantWords = 0;              // per rant part
+    int rantReturn = -1;            // the lecture's message the rant hands back to
     std::vector<std::string> texts; // per slot, as written so far
     std::vector<bool> done;         // per slot: written in full
     bool finished = false;          // the model stopped; a slot that isn't done plays as the game wrote it
@@ -1776,6 +1777,7 @@ public:
             rant.segments = std::clamp((rant.targetWords + 139) / 140, 1, kRantMax);
             rant.scripted = true;
             s->rantTopic = rant.topic;
+            s->rantReturn = rant.returnTo;
             s->rantWords = std::max(60, (rant.targetWords * 11 / 10 + rant.segments - 1) / std::max(1, rant.segments));
         }
 
@@ -1912,6 +1914,16 @@ public:
                 st.rescue = msg::original_from(t, f.page);
             }
             const bool pageDone = s.done[k];
+            const bool rantPart = s.slots[k].rantPart >= 0;
+            if (rantPart && !f.leadSent && (pageDone || s.finished) &&
+                sentence_end(s.texts[k] + " ", s.texts[k].size() + 1) == 0) {
+                // A rant part with no words (it has no text of the game's to fall back on): straight
+                // back to his lecture, not an empty text box.
+                append(msg::jump_to(s.rantReturn));
+                st.rescue.clear();
+                st.done = true;
+                return;
+            }
             if (s.finished && !pageDone) {
                 // The model stopped before finishing this page.
                 finish_original(f.leadSent ? after_words(t, f.page) : msg::original_from(t, f.page));
@@ -3785,127 +3797,179 @@ private:
             "- Plain spoken words only: no emoji, no quotation marks, no actions or narration.\n"
             "- Never mention being an AI or a game, and never comment on the task.";
 
-        std::ostringstream user;
-        user << "Character: Mr. Resetti (not a villager)\n";
-        if (!voice.empty()) {
-            user << "Personality: " << voice << "\n";
-        }
-        if (scene.valid) {
-            user << "Right now: " << scene_now(scene) << "\n";
-        }
-        if (!situation.empty()) {
-            user << "What's going on: " << situation << "\n";
-        }
-        if (!history.empty()) {
-            user << "Already said earlier in this visit (it's been on screen; carry on from it, don't repeat it):\n";
-            for (size_t h = history.size() > 8 ? history.size() - 8 : 0; h < history.size(); ++h) {
-                user << "- " << history[h] << "\n";
-            }
-        }
-        user << "\nWhat he says next, as the game wrote it. Lines marked (as is) stay exactly as they are and are "
-                "only there so you know the flow; rewrite every numbered page:\n";
-        std::string grammar = "root ::=";
-        std::string rules;
-        int maxTokens = 16;
-        size_t k = 0;
-        for (int no : s->msgs) {
-            const auto it = s->plans.find(no);
-            if (it == s->plans.end()) {
-                continue;
-            }
-            const auto& pages = it->second->tpl.pages;
-            for (size_t i = 0; i < pages.size(); ++i) {
-                if (k < s->slots.size() && s->slots[k].msgNo == no && s->slots[k].rantPart >= 0) {
-                    // His off-script rant: free yelling about its subject, as long as asked.
-                    const auto& slot = s->slots[k];
-                    const int parts = static_cast<int>(std::count_if(s->slots.begin(), s->slots.end(),
-                                                                     [](const Script::Slot& x) { return x.rantPart >= 0; }));
-                    const bool lastPart = slot.rantPart + 1 == parts;
-                    const int maxChars = std::max(200, slot.maxChars);
-                    const int minChars = std::clamp(s->rantWords * 5, 150, maxChars - 60);
-                    user << "Page " << (k + 1) << ": (HERE HE GOES OFF-SCRIPT: a long, unhinged rant about " << s->rantTopic
-                         << ", part " << (slot.rantPart + 1) << " of " << parts << ", about " << s->rantWords
-                         << " words of nonstop yelling in one go; "
-                         << (slot.rantPart == 0 ? "veer off the lecture onto the subject. " : "carry straight on from the last part. ")
-                         << (lastPart ? "Build to a climax, then swing back to the player resetting so he can get on with "
-                                        "his lecture."
-                                      : "Don't wrap up yet.")
-                         << " This page doesn't follow the game's text; it's his.)\n";
-                    const std::string pre = "p" + std::to_string(k);
-                    grammar += " \"Page " + std::to_string(k + 1) + ": \" " + pre + "root \"\\n\"";
-                    rules += pre + "c ::= [\\x20\\x21\\x23-\\x27\\x2B-\\x5B\\x5D-\\x7A\\x7C\\x7E] | \"{player}\"\n" + pre +
-                             "root ::= [A-Za-z] " + pre + "c{" + std::to_string(minChars) + "," + std::to_string(maxChars) +
-                             "} [.!?]\n";
-                    maxTokens += maxChars / 3 + 16;
-                    ++k;
-                } else if (k < s->slots.size() && s->slots[k].msgNo == no && s->slots[k].page == i) {
-                    const std::string label = "Page " + std::to_string(k + 1) + ": ";
-                    // The loose grammar: the strict one (sentence for sentence) runs at under half the
-                    // speed over a whole lecture and makes the model copy the game's wording.
-                    const auto pg = msg::free_page_grammar(pages[i], "p" + std::to_string(k), s->slots[k].maxChars);
-                    user << "Page " << (k + 1) << ": " << pages[i].text << "\n";
-                    grammar += " \"" + label + "\" " + pg.top + " \"\\n\"";
-                    rules += pg.rules;
-                    maxTokens += pg.totalWords * 2 + 8;
-                    ++k;
-                } else if (!pages[i].text.empty()) {
-                    user << "(as is) " << pages[i].text << "\n";
-                }
-            }
-        }
-        user << "\nWrite Page 1 to Page " << s->slots.size()
-             << " now, each on its own line starting with \"Page <number>: \". Every page keeps its own point and "
-                "details, in fresh words of his own: none of the game's sentences.";
-        grammar += "\n" + rules;
-        // What's left of the context after the prompt (about 3.2 characters a token).
-        const int promptTokens = static_cast<int>((system.size() + user.str().size()) * 10 / 32) + 64;
-        maxTokens = std::clamp(maxTokens, 256, std::max(256, m_config.embeddedContext - promptTokens));
-
-        // The reply is "Page 1: words\nPage 2: words\n...": each page's words go to its slot.
-        std::string raw;
-        int cur = -1;
-        std::string label;
+        // Up to three calls: if the model stops early (stuck in a loop, or it failed), what it wrote
+        // is kept up to its last whole sentence and the next call carries on from the next page.
         bool looping = false;
+        bool anyLoop = false;
+        std::optional<std::string> text;
         std::optional<Clock::time_point> firstPage;
-        auto onPiece = [&](std::string_view piece) {
-            raw.append(piece);
-            std::lock_guard lock(m_mutex);
-            if (m_script != s) {
-                return;
-            }
-            for (const char ch : piece) {
-                if (ch == '\n') {
-                    if (cur >= 0) {
-                        s->done[cur] = true;
-                        if (!firstPage) {
-                            firstPage = Clock::now();
-                        }
-                    }
-                    cur = -1;
-                    label.clear();
-                } else if (cur >= 0) {
-                    s->texts[cur] += ch;
-                } else {
-                    label += ch;
-                    if (label.size() >= 8 && label.rfind("Page ", 0) == 0 && label.compare(label.size() - 2, 2, ": ") == 0) {
-                        const int no = std::atoi(label.c_str() + 5);
-                        if (no >= 1 && no <= static_cast<int>(s->slots.size())) {
-                            cur = no - 1;
-                        }
+        int calls = 0;
+        for (size_t from = 0; from < s->slots.size() && calls < 3; ++calls) {
+            std::vector<std::string> said(history.size() > 8 ? history.end() - 8 : history.begin(), history.end());
+            {
+                std::lock_guard lock(m_mutex);
+                for (size_t j = 0; j < from; ++j) {
+                    if (!s->texts[j].empty()) {
+                        said.push_back(s->texts[j]);
                     }
                 }
             }
-            if (cur >= 0 && msg::is_looping(s->texts[cur])) {
-                looping = true;
+            if (said.size() > 10) {
+                said.erase(said.begin(), said.end() - 10);
             }
-        };
-        const auto text = complete("Mr. Resetti's lecture (" + std::to_string(s->slots.size()) + " pages)", system,
-                                   user.str(), grammar, json::object(), maxTokens, 0.7f,
-                                   [&] {
-                                       std::lock_guard lock(m_mutex);
-                                       return m_stopping.load() || looping || m_script != s;
-                                   },
-                                   onPiece);
+            std::ostringstream user;
+            user << "Character: Mr. Resetti (not a villager)\n";
+            if (!voice.empty()) {
+                user << "Personality: " << voice << "\n";
+            }
+            if (scene.valid) {
+                user << "Right now: " << scene_now(scene) << "\n";
+            }
+            if (!situation.empty()) {
+                user << "What's going on: " << situation << "\n";
+            }
+            if (!said.empty()) {
+                user << "Already said earlier in this visit (it's been on screen; carry on from it, don't repeat it):\n";
+                for (const auto& line : said) {
+                    user << "- " << line << "\n";
+                }
+            }
+            user << "\nWhat he says next, as the game wrote it. Lines marked (as is) stay exactly as they are and are "
+                    "only there so you know the flow; rewrite every numbered page:\n";
+            std::string grammar = "root ::=";
+            std::string rules;
+            int maxTokens = 16;
+            size_t k = 0;
+            const int parts = static_cast<int>(
+                std::count_if(s->slots.begin(), s->slots.end(), [](const Script::Slot& x) { return x.rantPart >= 0; }));
+            for (int no : s->msgs) {
+                const auto it = s->plans.find(no);
+                if (it == s->plans.end()) {
+                    continue;
+                }
+                const auto& pages = it->second->tpl.pages;
+                for (size_t i = 0; i < pages.size(); ++i) {
+                    const bool isSlot = k < s->slots.size() && s->slots[k].msgNo == no && s->slots[k].page == i;
+                    if (!isSlot) {
+                        if (k >= from && !pages[i].text.empty()) {
+                            user << "(as is) " << pages[i].text << "\n";
+                        }
+                        continue;
+                    }
+                    const auto& slot = s->slots[k];
+                    const std::string pre = "p" + std::to_string(k);
+                    const std::string label = "Page " + std::to_string(k + 1) + ": ";
+                    if (k < from) {
+                        // already written
+                    } else if (slot.rantPart >= 0) {
+                        // His off-script rant: free yelling about its subject, as long as asked.
+                        const bool lastPart = slot.rantPart + 1 == parts;
+                        const int maxChars = std::max(200, slot.maxChars);
+                        const int minChars = std::clamp(s->rantWords * 5, 150, maxChars - 60);
+                        user << label << "(HERE HE GOES OFF-SCRIPT: a long, unhinged rant about " << s->rantTopic
+                             << ", part " << (slot.rantPart + 1) << " of " << parts << ", about " << s->rantWords
+                             << " words of nonstop yelling in one go; "
+                             << (slot.rantPart == 0 ? "veer off the lecture onto the subject. "
+                                                    : "carry straight on from the last part. ")
+                             << (lastPart ? "Build to a climax, then swing back to the player resetting so he can get on "
+                                            "with his lecture."
+                                          : "Don't wrap up yet.")
+                             << " This page doesn't follow the game's text; it's his.)\n";
+                        grammar += " \"" + label + "\" " + pre + "root \"\\n\"";
+                        rules += pre + "c ::= [\\x20\\x21\\x23-\\x27\\x2B-\\x5B\\x5D-\\x7A\\x7C\\x7E] | \"{player}\"\n" +
+                                 pre + "root ::= [A-Za-z] " + pre + "c{" + std::to_string(minChars) + "," +
+                                 std::to_string(maxChars) + "} [.!?]\n";
+                        maxTokens += maxChars / 3 + 16;
+                    } else {
+                        // The loose grammar: the strict one (sentence for sentence) runs at under half the
+                        // speed over a whole lecture and makes the model copy the game's wording.
+                        const auto pg = msg::free_page_grammar(pages[i], pre, slot.maxChars);
+                        user << label << pages[i].text << "\n";
+                        grammar += " \"" + label + "\" " + pg.top + " \"\\n\"";
+                        rules += pg.rules;
+                        maxTokens += pg.totalWords * 2 + 8;
+                    }
+                    ++k;
+                }
+            }
+            user << "\nWrite Page " << (from + 1) << " to Page " << s->slots.size()
+                 << " now, each on its own line starting with \"Page <number>: \". Every page keeps its own point and "
+                    "details, in fresh words of his own: none of the game's sentences.";
+            grammar += "\n" + rules;
+            // What's left of the context after the prompt (about 3.2 characters a token).
+            const int promptTokens = static_cast<int>((system.size() + user.str().size()) * 10 / 32) + 64;
+            maxTokens = std::clamp(maxTokens, 256, std::max(256, m_config.embeddedContext - promptTokens));
+
+            // The reply is "Page N: words\nPage N+1: words\n...": each page's words go to its slot.
+            int cur = -1;
+            std::string label;
+            looping = false;
+            auto onPiece = [&](std::string_view piece) {
+                std::lock_guard lock(m_mutex);
+                if (m_script != s) {
+                    return;
+                }
+                for (const char ch : piece) {
+                    if (ch == '\n') {
+                        if (cur >= 0) {
+                            s->done[cur] = true;
+                            if (!firstPage) {
+                                firstPage = Clock::now();
+                            }
+                        }
+                        cur = -1;
+                        label.clear();
+                    } else if (cur >= 0) {
+                        s->texts[cur] += ch;
+                    } else {
+                        label += ch;
+                        if (label.size() >= 8 && label.rfind("Page ", 0) == 0 &&
+                            label.compare(label.size() - 2, 2, ": ") == 0) {
+                            const int no = std::atoi(label.c_str() + 5);
+                            if (no >= 1 && no <= static_cast<int>(s->slots.size())) {
+                                cur = no - 1;
+                            }
+                        }
+                    }
+                }
+                if (cur >= 0 && msg::is_looping(s->texts[cur])) {
+                    looping = true;
+                }
+            };
+            text = complete("Mr. Resetti's lecture (pages " + std::to_string(from + 1) + "-" +
+                                std::to_string(s->slots.size()) + ")",
+                            system, user.str(), grammar, json::object(), maxTokens, 0.7f,
+                            [&] {
+                                std::lock_guard lock(m_mutex);
+                                return m_stopping.load() || looping || m_script != s;
+                            },
+                            onPiece);
+            anyLoop = anyLoop || looping;
+            std::lock_guard lock(m_mutex);
+            if (m_script != s || m_stopping) {
+                break;
+            }
+            // The page it stopped on keeps its whole sentences (all the text box can have shown of it).
+            if (cur >= 0 && !s->done[cur]) {
+                std::string& t = s->texts[cur];
+                size_t end = 0;
+                for (size_t p = t.size(); p-- > 1;) {
+                    if (std::strchr(".!?", t[p - 1]) != nullptr && t[p] == ' ') {
+                        end = p;
+                        break;
+                    }
+                }
+                t.resize(end);
+                s->done[cur] = true;
+            }
+            from = 0;
+            while (from < s->slots.size() && s->done[from]) {
+                ++from;
+            }
+            if (from >= s->slots.size()) {
+                break;
+            }
+        }
         std::vector<std::pair<std::string, std::string>> fields;
         {
             std::lock_guard lock(m_mutex);
@@ -3927,7 +3991,7 @@ private:
             }
             fields = {
                 { "Outcome", replaced ? "stopped (the visit moved on or ended)"
-                             : looping ? "the model got stuck repeating itself; the rest played as the game wrote it"
+                             : anyLoop ? "the model got stuck repeating itself at least once; carried on from the next page"
                              : !text   ? "the model failed; unwritten pages played as the game wrote them"
                                        : "ok" },
                 { "Messages", msgs },
