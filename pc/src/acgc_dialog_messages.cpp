@@ -662,6 +662,64 @@ int chain_words(int first) {
     return words;
 }
 
+int rant_spot(int first) {
+    struct Msg {
+        int no;
+        int words;
+        bool leaving;
+    };
+    // What he says when he's on his way out: a rant after one of these has him leave and carry on.
+    static const char* const kLeaving[] = { "goin' home", "going home", "i'm leavin", "i'm leaving", "i'm outta here",
+                                            "i'm off", "gotta go", "i'm done for today", "see ya", "so long",
+                                            "goodbye", "bye-bye", "i'm outta", "back underground", "headin' back" };
+    std::vector<Msg> chain;
+    std::set<int> seen;
+    for (int no = first; no >= 0 && seen.insert(no).second && seen.size() < 32;) {
+        const auto bytes = original(no);
+        if (!bytes) {
+            break;
+        }
+        bool leaving = false;
+        if (const auto t = parse_template(*bytes)) {
+            for (const auto& page : t->pages) {
+                std::string low = page.text;
+                std::transform(low.begin(), low.end(), low.begin(),
+                               [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+                for (const char* cue : kLeaving) {
+                    leaving = leaving || low.find(cue) != std::string::npos;
+                }
+            }
+        }
+        chain.push_back({ no, spoken_words(*bytes), leaving });
+        no = next_target(*bytes);
+    }
+    // Only messages with one after them (the rant has to jump back to something), and none from
+    // the first one where he says he's leaving.
+    size_t usable = chain.empty() ? 0 : chain.size() - 1;
+    for (size_t i = 0; i < usable; ++i) {
+        if (chain[i].leaving) {
+            usable = i;
+            break;
+        }
+    }
+    if (usable == 0) {
+        return -1;
+    }
+    int total = 0;
+    for (const auto& m : chain) {
+        total += m.words;
+    }
+    // Halfway through his lecture, so he winds up to it and still has the rest to come back to.
+    int sofar = 0;
+    for (size_t i = 0; i < usable; ++i) {
+        sofar += chain[i].words;
+        if (sofar * 2 >= total && sofar > 0) {
+            return chain[i].no;
+        }
+    }
+    return chain[usable - 1].no;
+}
+
 bool is_looping(const std::string& text) {
     std::vector<std::string> words;
     std::string cur;
@@ -902,20 +960,88 @@ bool is_task_word(const std::string& word) {
                                                  "rewrite", "rewritten", "rewriting", "version", "here's", "heres",
                                                  "says", "line", "lines", "original", "response", "dialogue",
                                                  "dialog", "character", "personality", "style", "revised",
-                                                 "output", "text" };
+                                                 "output", "text", "attempt", "phrases", "reusing", "conversation" };
     return kTask.count(bare_word(word)) != 0;
+}
+
+// Words that start a sentence of narration or directions rather than speech.
+bool may_start_narration(const std::string& word) {
+    static const std::set<std::string> kStarts = { "wait", "waits", "waiting", "options", "option", "choices",
+                                                   "choice", "pause", "pauses", "note", "player", "the", "she",
+                                                   "he", "they", "end", "ends", "awaiting", "await", "response",
+                                                   "continue", "continues", "proceed", "then", "if" };
+    return kStarts.count(bare_word(word)) != 0 || word.front() == '[' || word.front() == '(';
+}
+
+// Words that only narration or directions use (a villager calls the player "you" or by name).
+bool is_narration_word(const std::string& word) {
+    static const std::set<std::string> kWords = { "player", "player's", "players", "options", "proceeding",
+                                                  "villager", "villager's", "narrator", "npc" };
+    return kWords.count(bare_word(word)) != 0;
+}
+
+// Words that give narration away wherever they are.
+bool is_narration_anywhere(const std::string& word) {
+    const std::string b = bare_word(word);
+    return b == "player's" || b == "players" || b == "npc" || b == "narrator" || b == "villager's" ||
+           ((b == "options" || b == "option" || b == "choices") && word.back() == ':');
 }
 
 } // namespace
 
+void LineStreamer::screen_word(const std::string& word, std::vector<uint8_t>& out, bool last) {
+    if (m_cut) {
+        return;
+    }
+    if (m_holdSentence) {
+        m_sentence.push_back(word);
+        if (last || m_sentence.size() >= 24 || std::strchr(".!?:", word.back()) != nullptr) {
+            judge_sentence(out, last);
+        }
+        return;
+    }
+    if (m_sentenceStart && may_start_narration(word)) {
+        m_holdSentence = true;
+        m_sentence = { word };
+        if (last || std::strchr(".!?:", word.back()) != nullptr) {
+            judge_sentence(out, last);
+        }
+        return;
+    }
+    if (is_narration_anywhere(word)) {
+        m_cut = true;
+        return;
+    }
+    commit_word(word, out, last);
+    m_sentenceStart = std::strchr(".!?", word.back()) != nullptr;
+}
+
+void LineStreamer::judge_sentence(std::vector<uint8_t>& out, bool last) {
+    m_holdSentence = false;
+    if (std::any_of(m_sentence.begin(), m_sentence.end(), is_narration_word)) {
+        m_cut = true;
+        m_sentence.clear();
+        return;
+    }
+    for (size_t k = 0; k < m_sentence.size(); ++k) {
+        if (is_narration_anywhere(m_sentence[k])) {
+            m_cut = true;
+            break;
+        }
+        commit_word(m_sentence[k], out, last && k + 1 == m_sentence.size());
+    }
+    m_sentenceStart = !m_sentence.empty() && std::strchr(".!?", m_sentence.back().back()) != nullptr;
+    m_sentence.clear();
+}
+
 void LineStreamer::take_word(const std::string& word, std::vector<uint8_t>& out, bool last) {
     if (!m_preambleCheck) {
-        commit_word(word, out, last);
+        screen_word(word, out, last);
         return;
     }
     if (m_held.empty() && !may_start_preamble(word)) {
         m_preambleCheck = false;
-        commit_word(word, out, last);
+        screen_word(word, out, last);
         return;
     }
     m_held.push_back(word);
@@ -926,6 +1052,18 @@ void LineStreamer::take_word(const std::string& word, std::vector<uint8_t>& out,
             return;
         }
     }
+    // Clearly about the task ("Here's my attempt at saying the villager's lines in their voice..."),
+    // colon or not: held to the end of its sentence and dropped.
+    const auto taskWords = std::count_if(m_held.begin(), m_held.end(), is_task_word);
+    if (taskWords >= 2 || std::any_of(m_held.begin(), m_held.end(), is_narration_anywhere)) {
+        const bool trailsOff = word.size() >= 3 && word.compare(word.size() - 3, 3, "...") == 0;
+        if (last || m_held.size() >= 40 || (std::strchr(".!?:", word.back()) != nullptr && !trailsOff)) {
+            m_cut = m_cut || m_held.size() >= 40; // still going: no way back to speech
+            m_held.clear();
+            m_preambleCheck = false;
+        }
+        return;
+    }
     if (last || m_held.size() >= 14 || std::strchr(".!?:", word.back()) != nullptr) {
         flush_held(out, last);
     }
@@ -934,7 +1072,7 @@ void LineStreamer::take_word(const std::string& word, std::vector<uint8_t>& out,
 void LineStreamer::flush_held(std::vector<uint8_t>& out, bool last) {
     m_preambleCheck = false;
     for (size_t k = 0; k < m_held.size(); ++k) {
-        commit_word(m_held[k], out, last && k + 1 == m_held.size());
+        screen_word(m_held[k], out, last && k + 1 == m_held.size());
     }
     m_held.clear();
 }
@@ -1023,6 +1161,9 @@ std::vector<uint8_t> LineStreamer::finish(bool endMessage) {
     }
     if (!m_held.empty()) {
         flush_held(out, /*last=*/true);
+    }
+    if (!m_sentence.empty()) {
+        judge_sentence(out, /*last=*/true);
     }
     if (endMessage) {
         out.insert(out.end(), { kCharControl, kLast });
@@ -1125,7 +1266,7 @@ RewriteRequest rewrite_request(const Template& t, const std::string& personality
         "wants or shows what: if the villager wants to buy the player's item, the rewrite still has the "
         "villager buying it.\n"
         "- Keep every {placeholder} the original page has; the game fills them in. {player} is the player's "
-        "name, {catchphrase} is the villager's catchphrase (it usually ends a sentence), {a_item0} is an item "
+        "name, {catchphrase} is the villager's catchphrase, a word they tack on (usually at the end of a sentence), never a name or a person, {a_item0} is an item "
         "with its article (\"a pear\"), {item0} is the same item without the article (\"pear\"), so never "
         "write \"a {a_item0}\". {free1} and similar are names, places or amounts; the original page shows "
         "what each one means. Don't make up new placeholders.\n"
@@ -1223,7 +1364,7 @@ std::string live_page_system(const std::string& setting, const std::string& tone
            "for or shown, every price and number, and who does what. The villager is the one speaking, to the "
            "player (\"you\").\n"
            "- Write every {placeholder} of the original page exactly as written and in the same order; the game "
-           "fills them in. {player} is the player's name, {catchphrase} is the villager's catchphrase, {a_item0} "
+           "fills them in. {player} is the player's name, {catchphrase} is the villager's catchphrase, a word they tack on, never a name or a person; {a_item0} "
            "is an item with its article (\"a pear\"), {item0} the same item without it, so never write \"a "
            "{a_item0}\". {free1} and similar are names, places or amounts: the original shows what each one "
            "means. Never make up new placeholders.\n"
@@ -1293,7 +1434,7 @@ PageGrammar page_grammar(const Page& page, const std::string& prefix) {
     // whole (a cap never cuts one), and nothing else can make up a placeholder.
     std::string g = out.top + " ::= (" + intro + " \" \")?";
     // Printable ASCII only (the font has no glyphs for most else), minus space, quote, asterisk,
-    // backslash and braces.
+    // backslash, braces and parentheses (no stage directions).
     // Names, dates and times are flavor too: the model may use the page's ones anywhere but
     // doesn't have to (forcing {town} into a line that went elsewhere makes the model pad
     // with junk until it can fit it in).
@@ -1305,7 +1446,7 @@ PageGrammar page_grammar(const Page& page, const std::string& prefix) {
             flavorUsed.insert(key);
         }
     });
-    std::string rules = c + " ::= [\\x21\\x23-\\x29\\x2B-\\x5B\\x5D-\\x7A\\x7C\\x7E] | \"{player}\" | \"{catchphrase}\"";
+    std::string rules = c + " ::= [\\x21\\x23-\\x27\\x2B-\\x5B\\x5D-\\x7A\\x7C\\x7E] | \"{player}\" | \"{catchphrase}\"";
     for (const auto& key : flavorUsed) {
         rules += " | \"{" + key + "}\"";
     }

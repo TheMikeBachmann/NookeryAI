@@ -977,6 +977,7 @@ struct Talk {
     std::vector<std::string> history; // what the villager has said so far (as shown), for context
     // Mr. Resetti: one visit can be several talks with the same actor; the rant happens once.
     bool special = false;
+    std::set<std::string> said; // Mr. Resetti: every sentence shown this visit (letters only), never shown twice
     bool firstPending = false; // the talk's first message hasn't loaded yet
     bool greeting = false;     // `situation` describes the greeting, for its message only
     int firstMsg = -1; // the first message of the talk that gets the rant (its lecture's length sets the rant's)
@@ -1496,9 +1497,10 @@ public:
         if (next < 0 || next >= kRantBase) {
             return false;
         }
-        const auto after = msg::original(next);
-        if (!after || msg::next_target(*after) >= 0) {
-            return false; // not the last message yet
+        // Halfway through his lecture, and never once he's said he's going (msg::rant_spot). A
+        // lecture with no such spot gets no rant.
+        if (msgNo != msg::rant_spot(m_talk.firstMsg)) {
+            return false;
         }
         auto& r = m_talk.rant;
         r.planned = true;
@@ -1963,6 +1965,29 @@ public:
             }
             return 0;
         };
+        // `end` cut back to before the last sentence if that's a question the game's page doesn't
+        // have (a setup whose answer hasn't arrived), as long as that keeps what's already shown.
+        auto hold_setup = [&](const std::string& text, size_t end, const std::string& original,
+                              size_t shown) -> size_t {
+            if (end < 2 || text[end - 1] != '?') {
+                return end;
+            }
+            const size_t start = sentence_end(text, end - 1);
+            if (start < shown) {
+                return end;
+            }
+            auto letters = [](std::string_view v) {
+                std::string out;
+                for (const char ch : v) {
+                    if (std::isalnum(static_cast<unsigned char>(ch))) {
+                        out += static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                    }
+                }
+                return out;
+            };
+            const std::string q = letters(std::string_view(text).substr(start, end - start));
+            return q.empty() || letters(original).find(q) != std::string::npos ? end : start;
+        };
         while (f.page < n) {
             const msg::Page& page = t.pages[f.page];
             const bool last = f.page + 1 == n;
@@ -2010,18 +2035,46 @@ public:
             }
             // Whole sentences only, so a page that runs into its length cap (which makes the grammar
             // end it on the spot) loses its unfinished last sentence instead of stopping mid-word.
+            // A question of his own ("You know who else loves it?") waits for the sentence after it,
+            // its punchline: if the cap cuts that off, the question goes too rather than hang there.
             std::string_view text = s.texts[k];
             if (!pageDone) {
-                text = text.substr(0, sentence_end(s.texts[k], text.size()));
+                text = text.substr(0, hold_setup(s.texts[k], sentence_end(s.texts[k], text.size()), page.text, f.consumed));
             } else if (!page.beforeChoice && s.slots[k].maxChars > 0 &&
                        static_cast<int>(text.size()) >= s.slots[k].maxChars * 9 / 10) {
                 if (const size_t end = sentence_end(s.texts[k], text.size() - 1); end >= f.consumed && end > 0) {
-                    text = text.substr(0, end);
+                    text = text.substr(0, hold_setup(s.texts[k], end, page.text, f.consumed));
                 }
             }
             std::vector<uint8_t> bytes;
             if (text.size() > f.consumed) {
-                bytes = f.streamer->feed(text.substr(f.consumed));
+                // A sentence he's already said this visit (the model loops back to its favourites over a
+                // long script) is skipped; short ones ("Hey!", "Now!") can come round again.
+                std::string fresh;
+                const std::string_view chunk = text.substr(f.consumed);
+                size_t at = 0;
+                while (at < chunk.size()) {
+                    size_t end = at;
+                    while (end < chunk.size() &&
+                           !(std::strchr(".!?", chunk[end]) != nullptr && end + 1 < chunk.size() && chunk[end + 1] == ' ')) {
+                        ++end;
+                    }
+                    end = std::min(chunk.size(), end + 1);
+                    const std::string_view sentence = chunk.substr(at, end - at);
+                    std::string key;
+                    for (const char ch : sentence) {
+                        if (std::isalnum(static_cast<unsigned char>(ch))) {
+                            key += static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                        }
+                    }
+                    if (key.size() < 16 || m_talk.said.insert(key).second) {
+                        fresh += sentence;
+                    }
+                    at = end;
+                }
+                if (!fresh.empty() && fresh.find_first_not_of(' ') != std::string::npos) {
+                    bytes = f.streamer->feed(fresh);
+                }
                 f.consumed = text.size();
             }
             if (pageDone) {
@@ -2044,6 +2097,13 @@ public:
             }
             if (!pageDone) {
                 return; // more to come
+            }
+            if (!f.leadSent && rantPart) {
+                // Every sentence of this rant part was a repeat: straight back to his lecture.
+                append(msg::jump_to(s.rantReturn));
+                st.rescue.clear();
+                st.done = true;
+                return;
             }
             if (!f.leadSent) {
                 append(page.original); // the model wrote nothing usable for it
@@ -3378,8 +3438,8 @@ ws     ::= [ \t\n]{0,4}
             user << "\nSay it now.";
 
             // Plain text, one line; the model stops when it's done.
-            // Printable ASCII minus quote, asterisk and backslash (the font has no glyphs for most else).
-            const std::string kGrammar = "root ::= [\\x20\\x21\\x23-\\x29\\x2B-\\x5B\\x5D-\\x7E]{12," +
+            // Printable ASCII minus quote, asterisk, backslash and parentheses (the font has no glyphs for most else).
+            const std::string kGrammar = "root ::= [\\x20\\x21\\x23-\\x27\\x2B-\\x5B\\x5D-\\x7E]{12," +
                                          std::to_string(m_config.maxLineChars) + "}\n";
             prompt = user.str();
             // About 4 characters per token in English; leave headroom so the character cap is what stops it.
@@ -3697,8 +3757,8 @@ private:
         }
         user << "\n\nSay it now.";
 
-        // Printable ASCII minus quote, asterisk and backslash; at least minChars, ending a sentence.
-        const std::string grammar = "root ::= [\\x20\\x21\\x23-\\x29\\x2B-\\x5B\\x5D-\\x7E]{" + std::to_string(minChars) +
+        // Printable ASCII minus quote, asterisk, backslash and parentheses; at least minChars, ending a sentence.
+        const std::string grammar = "root ::= [\\x20\\x21\\x23-\\x27\\x2B-\\x5B\\x5D-\\x7E]{" + std::to_string(minChars) +
                                     "," + std::to_string(maxChars) + "} [.!?]\n";
         const int maxTokens = maxChars / 3 + 32;
 
@@ -3919,6 +3979,7 @@ private:
             std::string rules;
             int maxTokens = 16;
             size_t k = 0;
+            std::string room; // how many words each page has room for
             const int parts = static_cast<int>(
                 std::count_if(s->slots.begin(), s->slots.end(), [](const Script::Slot& x) { return x.rantPart >= 0; }));
             for (int no : s->msgs) {
@@ -3959,6 +4020,8 @@ private:
                                  pre + "root ::= [A-Za-z] " + pre + "c{" + std::to_string(minChars) + "," +
                                  std::to_string(maxChars) + "} [.!?]\n";
                         maxTokens += maxChars / 3 + 16;
+                        room += (room.empty() ? "" : ", ") + std::string("Page ") + std::to_string(k + 1) + " " +
+                                std::to_string(maxChars / 6);
                     } else {
                         // The loose grammar: the strict one (sentence for sentence) runs at under half the
                         // speed over a whole lecture and makes the model copy the game's wording.
@@ -3967,6 +4030,10 @@ private:
                         grammar += " \"" + label + "\" " + pg.top + " \"\\n\"";
                         rules += pg.rules;
                         maxTokens += pg.totalWords * 2 + 8;
+                        if (k >= from) {
+                            room += (room.empty() ? "" : ", ") + std::string("Page ") + std::to_string(k + 1) + " " +
+                                    std::to_string(std::max(6, pg.maxChars / 6));
+                        }
                     }
                     ++k;
                 }
@@ -3974,6 +4041,13 @@ private:
             user << "\nWrite Page " << (from + 1) << " to Page " << s->slots.size()
                  << " now, each on its own line starting with \"Page <number>: \". Every page keeps its own point and "
                     "details, in fresh words of his own: none of the game's sentences.";
+            if (!room.empty()) {
+                user << " Each page is cut off at its limit (most words, everything on it included): " << room
+                     << ". Finish every thought well inside its page. If he sets something up (a question like \"You "
+                        "know who else loves it?\", a \"lemme tell you...\", a threat), the payoff comes right after "
+                        "it on the same page, and make it the most shocking thing he says; never leave one hanging "
+                        "or carry it over to the next page.";
+            }
             grammar += "\n" + rules;
             // What's left of the context after the prompt (about 3.2 characters a token).
             const int promptTokens = static_cast<int>((system.size() + user.str().size()) * 10 / 32) + 64;

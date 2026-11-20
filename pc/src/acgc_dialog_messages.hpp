@@ -93,6 +93,10 @@ std::vector<uint8_t> jump_to(int to);
 int spoken_words(const std::vector<uint8_t>& bytes);
 // spoken_words over message `first` and everything it jumps on to with <NEXT_F n>.
 int chain_words(int first);
+// Where Mr. Resetti's rant goes in a lecture starting at message `first`: the message to put it
+// after (about halfway through by words, never after one where he says he's leaving, never the
+// last), or -1 if there's nowhere.
+int rant_spot(int first);
 
 // True when the end of `text` is the model stuck in a loop: the same phrase of 3+ words twice
 // in a row, or the same word or pair four times.
@@ -127,12 +131,20 @@ private:
     // what the villager says in their own voice:"), which is dropped.
     void take_word(const std::string& word, std::vector<uint8_t>& out, bool last = false);
     void flush_held(std::vector<uint8_t>& out, bool last);
+    // Drops the model stepping out of the character to narrate or give itself directions ("Wait for
+    // the player's response before proceeding. Options: 1."): that sentence and everything after it.
+    void screen_word(const std::string& word, std::vector<uint8_t>& out, bool last);
+    void judge_sentence(std::vector<uint8_t>& out, bool last);
     void commit_word(const std::string& word, std::vector<uint8_t>& out, bool last = false);
 
     ResolveFn m_resolve;
     void* m_user;
     bool m_preambleCheck = true;
     std::vector<std::string> m_held;
+    std::vector<std::string> m_sentence; // a sentence that starts like narration, held until it ends
+    bool m_holdSentence = false;
+    bool m_sentenceStart = true;
+    bool m_cut = false; // narration found: nothing more is shown
     std::string m_pending;
     std::string m_dropLeading;
     std::string m_text;
